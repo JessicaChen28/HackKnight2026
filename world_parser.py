@@ -146,14 +146,25 @@ def reconstruct_features(data, source):
     occupied = unary_union([g for fid, g in originals.items() if fid not in oceans])
     sea = bounds.difference(occupied)
     ocean_parts = defaultdict(list)
+    unassigned_water = []
+    mesh = unary_union(list(originals.values()))
     for component in ([] if sea.is_empty else polygon_parts(sea)):
         owners = [fid for fid, g in oceans.items() if component.intersection(g).area > 1e-8]
+        if not owners and component.intersection(bounds.boundary).length > 0:
+            # Boundary pseudo-sites can leave a disconnected background-water
+            # patch with NO real ocean cells (e.g. seed 312906270). Preserve its
+            # actual boundary, but do not invent or borrow an Azgaar feature ID.
+            if component.intersection(mesh).area <= max(bounds.area * 1e-10, 1e-8):
+                unassigned_water.append(component)
+                continue
         if len(owners) != 1:
-            raise ValueError(f"Cannot assign ocean geometry unambiguously to source features: {owners}")
+            raise ValueError(f"Cannot assign ocean geometry unambiguously to source features: {owners}; area={component.area}, bounds={component.bounds}")
         ocean_parts[owners[0]].append(component)
     if set(ocean_parts) != set(oceans):
         raise ValueError("An ocean feature was lost while reconstructing the map coverage")
     originals.update({fid: unary_union(parts) for fid, parts in ocean_parts.items()})
+    if unassigned_water:
+        originals[None] = unary_union(unassigned_water)
     validate_coverage(originals, bounds)
     return originals, bounds
 
@@ -317,6 +328,12 @@ def build_coastlines(data, source, world, tolerance=3.0):
         entry = {"feature_id": fid, **{k: feature[k] for k in ("name", "type", "subtype") if k in feature},
                  "geometry": mapping(simplified[fid])}
         output["landmasses" if feature.get("land") else "water_bodies"].append(entry)
+    if None in simplified:
+        output["water_bodies"].append({
+            "feature_id": None, "type": "ocean",
+            "source": "map-edge background water without an Azgaar feature ID",
+            "geometry": mapping(simplified[None]),
+        })
     validate_outputs(world, output)
     return output
 
@@ -351,8 +368,15 @@ def validate_outputs(world, coastlines):
         geometries[fid] = shape(geojson)
     expected = {f["i"] for f in world["pack"]["features"]}
     expected_land = {f["i"] for f in world["pack"]["features"] if f.get("land")}
-    if set(geometries) != expected or {f["feature_id"] for f in coastlines["landmasses"]} != expected_land:
+    if set(geometries) - {None} != expected or {f["feature_id"] for f in coastlines["landmasses"]} != expected_land:
         raise ValueError("Missing, added, or misclassified landmasses/water bodies")
+    if None in geometries:
+        entry = next(e for e in coastlines["water_bodies"] if e["feature_id"] is None)
+        bounds = box(0, 0, width, height)
+        if entry.get("type") != "ocean" or any(
+            p.intersection(bounds.boundary).length == 0 for p in polygon_parts(geometries[None])
+        ):
+            raise ValueError("Unassigned water must be ocean background touching the map edge")
     validate_coverage(geometries, box(0, 0, width, height))
     failed = settlement_failures(world, geometries)
     if failed:
@@ -396,6 +420,8 @@ def process_world(minimal_path, source, tolerance=3.0):
     print(f"World: {world['metadata'].get('mapName', '(unnamed)')}")
     print(f"Settlements: {len(pack['burgs'])}\nStates (including neutral): {len(pack['states'])}\nProvinces: {len(pack['provinces'])}")
     print(f"Landmasses: {len(coastlines['landmasses'])}\nWater bodies: {len(coastlines['water_bodies'])}")
+    if any(e["feature_id"] is None for e in coastlines["water_bodies"]):
+        print("Note: map-edge background water retained with feature_id=null (Azgaar supplies no ID).")
     print(f"Original coastline vertices: {stats['original_vertices']}\nSimplified coastline vertices: {stats['simplified_vertices']}\nReduction: {stats['reduction_percent']}%")
     print(f"Original Minimal JSON: {minimal_path.stat().st_size / 1_000_000:.2f} MB\nFiltered world JSON: {world_path.stat().st_size / 1000:.1f} KB\nCoastline JSON: {coast_path.stat().st_size / 1000:.1f} KB")
     print("Validation: PASSED", flush=True)

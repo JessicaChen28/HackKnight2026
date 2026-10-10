@@ -85,7 +85,9 @@ exports/
 
 Existing flat JSON exports are left in place. `generate_world(...)` still returns the `Path` to the original export, now named `azgaar_minimal.json` inside the new directory.
 
-The original download remains byte-for-byte unchanged. Validation failures leave the original for recovery and report the failure; incomplete processed files are removed. Browser resources close on success, failure, or Ctrl+C. Failures return a nonzero exit code. `--timeout` applies separately to each browser operation, not the entire run.
+The original download remains byte-for-byte unchanged. Validation failures leave both the original and the captured `geometry_source.json` for diagnosis and report the failure; incomplete processed files are removed. Successful runs keep the source snapshot only with `--keep-geometry-source`. Browser resources close on success, failure, or Ctrl+C. Failures return a nonzero exit code. `--timeout` applies separately to each browser operation, not the entire run.
+
+If Azgaar produces inconsistent geography (for example, a settlement already outside its land feature), generation automatically tries a fresh random world, up to **five attempts**. Use `--attempts 1` to disable replacements or `--attempts N` to choose the limit. Rejected directories include `validation_error.json` and diagnostic inputs; they are not usable processed worlds. The final `Validation: PASSED` and `Saved world files:` messages identify the successful world directory. Disk, dependency, and network errors are not retried as bad worlds. Retrying cannot guarantee success if the upstream schema changes; exhaustion reports a nonzero exit status with the last validation error.
 
 ## Output schemas
 
@@ -108,7 +110,7 @@ Both processed files have `schema_version: 1`. Absent optional fields remain abs
 
 Minimal JSON includes feature vertex **IDs**, but omits `pack.vertices.p`, the coordinate table. `geometry_source.py` reads ordered polygons from `pack.cells.v`, resolves them through `pack.vertices.p`, and groups them by `pack.cells.f`. The parser unions these cells and clips to the map rectangle. This captures multiple components, lakes as holes, and islands within lakes. A single `feature.vertices` outline is insufficient to represent all holes, and ocean features have empty vertex arrays.
 
-Azgaar drops deep-ocean cells and gives its boundary pseudo-sites no polygons. Consequently, the packed mesh does not fill the map. The parser derives sea regions from the map rectangle minus land and lakes, then associates each connected sea region with the unique overlapping original ocean feature. Ambiguous or missing ocean ownership is an error, never a guessed ID.
+Azgaar drops deep-ocean cells and gives its boundary pseudo-sites no polygons. Consequently, the packed mesh does not fill the map. The parser derives sea regions from the map rectangle minus land and lakes, then associates each connected sea region with the unique overlapping original ocean feature. A disconnected map-edge background-water patch may contain no source ocean cells at all. Such patches are preserved together as an ocean Polygon/MultiPolygon with `feature_id: null` and an explicit `source` description, since Azgaar provides no feature ID for them. All original feature IDs remain intact. Interior regions without an owner, or regions overlapping multiple ocean features, still fail validation rather than receiving guessed IDs.
 
 Geometry follows Azgaar's **geographic cell mesh**, which its settlement placement uses. Decorative fractal displacement and SVG curve smoothing are not part of this representation. No source objects or original coordinates are modified in the browser.
 
@@ -124,7 +126,7 @@ Tolerance `3` means three map units, independent of the map's distance display u
 python generate_world.py --keep-geometry-source
 ```
 
-This adds an optional fourth file, `geometry_source.json`, containing the same-world raw cell rings, seed, and dimensions. It is larger than the processed coastline file and is useful for debugging or trying other tolerances without reopening Azgaar.
+This retains an optional fourth file, `geometry_source.json`, containing the same-world raw cell rings, seed, and dimensions. It is larger than the processed coastline file and is useful for debugging or trying other tolerances without reopening Azgaar. Failed parsing runs retain this snapshot automatically, even without the flag.
 
 To reprocess, copy `azgaar_minimal.json` and `geometry_source.json` into a **new directory** (existing processed files are never overwritten), then run:
 

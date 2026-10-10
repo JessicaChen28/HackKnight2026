@@ -163,6 +163,22 @@ class RealWorldTests(unittest.TestCase):
 
 
 class GeometryEdgeCases(unittest.TestCase):
+    def test_actual_lorteland_map_edge_water_has_no_invented_feature_id(self):
+        with gzip.open(FIXTURE.with_name("lorteland.json.gz"), "rt", encoding="utf-8") as stream:
+            fixture = json.load(stream)
+        data, source = fixture["minimal"], fixture["geometry_source"]
+        self.assertEqual(str(data["info"]["seed"]), "312906270")
+        world = wp.parse_world(data)
+        coast = wp.build_coastlines(data, source, world)
+        wp.validate_outputs(world, coast)
+        unassigned = [w for w in coast["water_bodies"] if w["feature_id"] is None]
+        self.assertEqual(len(unassigned), 1)
+        patch = shape(unassigned[0]["geometry"])
+        self.assertAlmostEqual(patch.area, 1.9285801630941093, places=7)
+        self.assertGreater(patch.intersection(box(0, 0, 1440, 900).boundary).length, 0)
+        self.assertEqual({e["feature_id"] for e in coast["landmasses"] + coast["water_bodies"]} - {None},
+                         {f["i"] for f in wp.records(data["pack"]["features"])})
+
     def test_nested_lake_and_populated_island_survive_aggressive_rdp(self):
         outer, lake, island = box(0, 0, 100, 100), box(20, 20, 80, 80), box(49, 49, 51, 51)
         originals = {1: outer.difference(lake), 2: lake.difference(island), 3: island}

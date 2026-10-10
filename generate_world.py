@@ -16,6 +16,7 @@ try:
     from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
     from playwright.sync_api import sync_playwright
     from world_parser import process_world, write_json
+    from shapely.errors import GEOSException
 except ModuleNotFoundError as error:
     if error.name in ("playwright", "shapely", "numpy"):
         print(
@@ -87,10 +88,29 @@ def reserve_world_directory(suggested: str, world_name: str) -> Path:
             counter += 1
 
 
+class WorldProcessingError(RuntimeError):
+    """A generated world's source data cannot produce validated output."""
+
+
 def generate_world(headless: bool = True, timeout_seconds: int = 180,
-                   coastline_tolerance: float = 3.0, keep_geometry_source: bool = False) -> Path:
+                   coastline_tolerance: float = 3.0, keep_geometry_source: bool = False,
+                   max_attempts: int = 5) -> Path:
     if not math.isfinite(coastline_tolerance) or coastline_tolerance < 0:
         raise ValueError("Coastline tolerance must be finite and nonnegative")
+    if max_attempts < 1:
+        raise ValueError("Maximum generation attempts must be positive")
+    for attempt in range(1, max_attempts + 1):
+        print(f"World generation attempt {attempt}/{max_attempts}", flush=True)
+        try:
+            return _generate_world_once(headless, timeout_seconds, coastline_tolerance, keep_geometry_source)
+        except WorldProcessingError as error:
+            if attempt == max_attempts:
+                raise WorldProcessingError(f"No valid world after {max_attempts} attempts. Last failure: {error}") from error
+            print(f"World rejected: {error}\nGenerating a fresh replacement world...", flush=True)
+    raise AssertionError("Unreachable generation state")
+
+
+def _generate_world_once(headless, timeout_seconds, coastline_tolerance, keep_geometry_source):
     EXPORTS.mkdir(parents=True, exist_ok=True)
     timeout_ms = timeout_seconds * 1000
     with sync_playwright() as playwright:
@@ -148,15 +168,26 @@ def generate_world(headless: bool = True, timeout_seconds: int = 180,
                     temporary.unlink(missing_ok=True)
 
                 print("Extracting geographic cell coordinates from this world...", flush=True)
+                source_path = directory / "geometry_source.json"
                 try:
                     geometry_source = extract_geometry(page)
-                    if keep_geometry_source:
-                        write_json(directory / "geometry_source.json", geometry_source)
+                    # Persist before parsing so a failed run can be repaired offline.
+                    write_json(source_path, geometry_source)
                     print("Filtering world data and simplifying coastlines...", flush=True)
-                    process_world(destination, geometry_source, coastline_tolerance)
+                    try:
+                        process_world(destination, geometry_source, coastline_tolerance)
+                    except (ValueError, KeyError, TypeError, GEOSException) as error:
+                        # Preserve diagnostic inputs and distinguish invalid world
+                        # data from disk/installation/network errors (not retried).
+                        write_json(directory / "validation_error.json", {"error": str(error), "seed": generated["seed"]})
+                        raise WorldProcessingError(str(error)) from error
                 except Exception:
                     print(f"World processing failed. Original Minimal JSON retained at: {destination}", file=sys.stderr)
+                    if source_path.exists():
+                        print(f"Geometry source retained for offline retry: {source_path}", file=sys.stderr)
                     raise
+                if not keep_geometry_source:
+                    source_path.unlink()
                 print(f"Saved world files: {directory}", flush=True)
                 # Preserve the existing Python API's return value: the raw export.
                 return destination
@@ -172,12 +203,16 @@ def main() -> int:
     parser.add_argument("--timeout", type=int, default=180, metavar="SECONDS", help="Timeout per browser operation (default: 180)")
     parser.add_argument("--coastline-tolerance", type=float, default=3.0, metavar="MAP_UNITS", help="Maximum RDP tolerance, reduced where needed (default: 3)")
     parser.add_argument("--keep-geometry-source", action="store_true", help="Also retain raw cell coordinates for offline reprocessing/debugging")
+    parser.add_argument("--attempts", type=int, default=5, help="Maximum worlds to try after geographical validation failures (default: 5)")
     args = parser.parse_args()
     if args.timeout <= 0:
         parser.error("--timeout must be positive")
+    if args.attempts < 1:
+        parser.error("--attempts must be positive")
     try:
         generate_world(headless=not args.headed, timeout_seconds=args.timeout,
-                       coastline_tolerance=args.coastline_tolerance, keep_geometry_source=args.keep_geometry_source)
+                       coastline_tolerance=args.coastline_tolerance, keep_geometry_source=args.keep_geometry_source,
+                       max_attempts=args.attempts)
         return 0
     except PlaywrightTimeoutError as error:
         print(f"Timed out waiting for Azgaar: {error}\nTry --headed or increase --timeout.", file=sys.stderr)
