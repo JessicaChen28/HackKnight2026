@@ -1,6 +1,6 @@
 # HackKnight 2026
 
-Team: Hasan, Ayesha, and Jessica.
+Team: Hasan, and Jessica.
 
 ## SOLAR RPG native desktop application
 
