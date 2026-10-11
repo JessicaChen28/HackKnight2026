@@ -26,7 +26,7 @@ import sys
 import time
 from pathlib import Path
 
-DEFAULT_MODEL = "gemini-3.5-flash"  # override with GEMINI_MODEL or --model
+DEFAULT_MODEL = "gemini-3.5-flash-lite"  # override with GEMINI_MODEL or --model
 COLLECTIONS = {
     "burg": "burgs", "state": "states", "province": "provinces", "culture": "cultures",
     "religion": "religions", "marker": "markers", "feature": "features",
