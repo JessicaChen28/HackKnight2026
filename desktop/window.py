@@ -16,7 +16,7 @@ from PySide6.QtWidgets import (QFileDialog, QHBoxLayout, QLabel, QMainWindow,
 from desktop.screens import CharacterCreationScreen, GameplayScreen, MainMenuScreen, SettingsScreen
 from desktop.audio import AudioError, AudioPlayback, ElevenLabsAudioService
 from desktop.services import (AzgaarWorldProvider, CampaignIntro, GameError, GameService,
-                              GameSession, MockGameService, PhaseTwoCampaignService,
+                              GameSession, CharacterRevision, MockGameService, PhaseTwoCampaignService,
                               SampleWorldProvider, WorldProvider, WorldRef)
 from desktop.storage import ApiKeyVault, GameSaveStore, Preferences
 
@@ -70,9 +70,7 @@ class MainWindow(QMainWindow):
         self.vault = vault or ApiKeyVault(self.preferences.settings)
         self.world_provider = world_provider or AzgaarWorldProvider()
         self.sample_provider = sample_provider or SampleWorldProvider()
-        # Phase 2A owns only the campaign opening. Character creation and play
-        # intentionally remain mock placeholders until their Phase 2 services
-        # arrive. The vault supplies the key in memory, never via a save file.
+        # The vault supplies the key in memory, never via a save file.
         self.game_service = game_service or PhaseTwoCampaignService(
             self.vault.gemini_key)
         self.demo_game_service = demo_game_service or MockGameService()
@@ -92,6 +90,7 @@ class MainWindow(QMainWindow):
         self._callback: Callable[[object], None] | None = None
         self._closing = False
         self._pending_narration: tuple[str, str] | None = None
+        self._pending_audio_cues: dict | None = None
 
         root = QWidget()
         outer = QVBoxLayout(root)
@@ -142,6 +141,8 @@ class MainWindow(QMainWindow):
         self.game.menu_button.clicked.connect(self.show_menu)
         self.game.save_button.clicked.connect(self.save_game)
         self.game.send_button.clicked.connect(self.take_action)
+        self.game.nearby.itemDoubleClicked.connect(self.prepare_travel)
+        self.game.npcs.itemDoubleClicked.connect(self.prepare_conversation)
         self.settings_screen.back_button.clicked.connect(self.show_menu)
         self.settings_screen.save_button.clicked.connect(self.save_settings)
         self.settings_screen.save_gemini_button.clicked.connect(self.save_gemini_key)
@@ -215,8 +216,10 @@ class MainWindow(QMainWindow):
         self._set_busy(False)
         if self._pending_narration is not None and not self._closing:
             text, world_name = self._pending_narration
+            cues = self._pending_audio_cues
             self._pending_narration = None
-            self._start_narration(text, world_name)
+            self._pending_audio_cues = None
+            self._start_narration(text, world_name, cues)
         if self._closing:
             QTimer.singleShot(0, self.close)
 
@@ -362,20 +365,45 @@ class MainWindow(QMainWindow):
         print(f"Promoted completed campaign: {target.name}", flush=True)
         return WorldRef(world.name, str(target), world.seed)
 
-    def _start_narration(self, text: str, world_name: str) -> None:
+    def _start_narration(self, text: str, world_name: str, cues: dict | None = None) -> None:
         if not self.audio_service.api_key():
-            self._show_message(f"Campaign ready: {world_name} (ElevenLabs key missing; text-only mode).")
+            self._show_message(f"{world_name}: narration unavailable; continuing in text-only mode.")
             return
         def task(cancel: Event, progress: Callable[[str], None]):
             if cancel.is_set():
                 print("ElevenLabs narration: worker cancelled before request.", flush=True)
-                return None
+                return []
+            paths = []
             try:
-                return self.audio_service.speak_narration(text)
+                paths.append(self.audio_service.speak_narration(text))
             except AudioError:
-                return None
+                return []
+            world_cues = {
+                "harbor": "Harbor gulls and gentle waves",
+                "quest_complete": "A short triumphant chime",
+                "danger": "Distant warning bells",
+            }
+            descriptions = list((cues or {}).get("sfx", []))
+            descriptions.extend(world_cues[item["cue"]] for item in (cues or {}).get("world_cues", [])
+                                if isinstance(item, dict) and item.get("kind") == "sfx"
+                                and item.get("cue") in world_cues)
+            ambience = (cues or {}).get("ambience")
+            if isinstance(ambience, str):
+                descriptions.append(ambience)
+            descriptions.extend(world_cues[item["cue"]] for item in (cues or {}).get("world_cues", [])
+                                if isinstance(item, dict) and item.get("kind") == "ambience"
+                                and item.get("cue") in world_cues)
+            for description in descriptions[:4]:
+                if cancel.is_set():
+                    break
+                try:
+                    paths.append(self.audio_service.play_sound_effect(description))
+                except AudioError:
+                    continue
+            return paths
         self._run_task("Generating narration audio...", task,
-                       lambda path: path and self.audio_playback.play(path, self.preferences.audio_volume()))
+                       lambda paths: paths and self.audio_playback.play_sequence(
+                           paths, self.preferences.audio_volume()))
 
     def create_character(self) -> None:
         if self.intro is None or self._thread is not None:
@@ -383,8 +411,20 @@ class MainWindow(QMainWindow):
         description = self.creation.description.toPlainText()
         intro = self.intro
         self._run_task("Creating character...",
-                       lambda cancel, progress: self._active_game_service.create_character(intro, description, cancel),
-                       self._show_session)
+                       lambda cancel, progress: (
+                           self._active_game_service.create_character(intro, description, cancel, progress)
+                           if isinstance(self._active_game_service, PhaseTwoCampaignService)
+                           else self._active_game_service.create_character(intro, description, cancel)),
+                       self._show_created_character)
+
+    def _show_created_character(self, value: object) -> None:
+        if isinstance(value, CharacterRevision):
+            self.creation.show_revision(value.questions)
+            self._show_message("Gemini needs a little more detail about your character.")
+            return
+        self._show_session(value)
+        if isinstance(value, GameSession):
+            self._queue_session_narration(value)
 
     def _show_session(self, value: object) -> None:
         assert isinstance(value, GameSession)
@@ -392,6 +432,29 @@ class MainWindow(QMainWindow):
         self.game.show_session(value)
         self.stack.setCurrentWidget(self.game)
         self._show_message(f"Now exploring {value.world.name}.")
+
+    def _queue_session_narration(self, session: GameSession) -> None:
+        if session.last_narration and self.preferences.audio_enabled():
+            self._pending_narration = (session.last_narration, session.world.name)
+            self._pending_audio_cues = session.audio_cues
+
+    def _show_action_session(self, value: object) -> None:
+        self._show_session(value)
+        if isinstance(value, GameSession):
+            self._queue_session_narration(value)
+
+    def prepare_travel(self, item) -> None:
+        if self._thread is not None:
+            return
+        self.game.action.setPlainText(f"I seek a safe way to travel to {item.text()}.")
+        self.game.action.setFocus()
+
+    def prepare_conversation(self, item) -> None:
+        if self._thread is not None:
+            return
+        name = item.text().split(" — ", 1)[0]
+        self.game.action.setPlainText(f"I speak with {name}.")
+        self.game.action.setFocus()
 
     def take_action(self) -> None:
         if self.session is None or self._thread is not None:
@@ -402,7 +465,7 @@ class MainWindow(QMainWindow):
                            self._active_game_service.perform_action(session, action, cancel, progress)
                            if isinstance(self._active_game_service, PhaseTwoCampaignService)
                            else self._active_game_service.perform_action(session, action, cancel)),
-                       self._show_session)
+                       self._show_action_session)
 
     def save_game(self) -> None:
         if self.session is None or self._thread is not None:
@@ -423,7 +486,12 @@ class MainWindow(QMainWindow):
 
     def load_game_from_path(self, path: Path) -> None:
         self._run_task("Loading game...",
-                       lambda cancel, progress: self.save_store.load(path), self._show_session)
+                       lambda cancel, progress: self.save_store.load(path), self._show_loaded_session)
+
+    def _show_loaded_session(self, value: object) -> None:
+        assert isinstance(value, GameSession)
+        self._active_game_service = self.game_service if value.world.directory else self.demo_game_service
+        self._show_session(value)
 
     def open_settings(self) -> None:
         if self._thread is not None:

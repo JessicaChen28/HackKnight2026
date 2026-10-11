@@ -179,6 +179,8 @@ class AudioPlayback:
         self._player = None
         self._output = None
         self._source = None
+        self._playlist: list[Path] = []
+        self._playlist_volume = 70
         try:
             from PySide6.QtCore import QThread
             from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
@@ -187,6 +189,7 @@ class AudioPlayback:
             self._player = QMediaPlayer(owner)
             self._player.setAudioOutput(self._output)
             self._player.errorOccurred.connect(self._on_error)
+            self._player.mediaStatusChanged.connect(self._on_media_status)
             self._qt_thread = QThread.currentThread()
             print("Qt Multimedia: narration playback available on the GUI thread.", flush=True)
         except Exception as error:
@@ -195,6 +198,26 @@ class AudioPlayback:
 
     def _on_error(self, error) -> None:
         print(f"Qt Multimedia: playback failed ({error}).", flush=True)
+        self._advance_playlist()
+
+    def _on_media_status(self, status) -> None:
+        if self._player is None:
+            return
+        from PySide6.QtCore import QTimer
+        from PySide6.QtMultimedia import QMediaPlayer
+        if status == QMediaPlayer.MediaStatus.EndOfMedia:
+            QTimer.singleShot(0, self._advance_playlist)
+
+    def _advance_playlist(self) -> None:
+        if self._playlist:
+            path = self._playlist.pop(0)
+            self.play(path, self._playlist_volume)
+
+    def play_sequence(self, paths: list[Path], volume: int = 70) -> None:
+        """Play generated narration and sound cues in order on the GUI thread."""
+        self._playlist = [Path(path) for path in paths]
+        self._playlist_volume = volume
+        self._advance_playlist()
 
     def play(self, path: Path, volume: int = 70, loop: bool = False) -> None:
         if self._player is None:
@@ -212,6 +235,7 @@ class AudioPlayback:
         print(f"Qt Multimedia: playback started ({path.name}, mp3).", flush=True)
 
     def stop(self) -> None:
+        self._playlist.clear()
         if self._player is not None:
             self._player.stop()
             print("Qt Multimedia: playback stopped.", flush=True)

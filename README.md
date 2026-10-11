@@ -1,6 +1,6 @@
-# HackKnight 2026
+# SOLAR RPG
 
-Team: Hasan, Ayesha, and Jessica.
+Team: Hasan and Jessica.
 
 ## SOLAR RPG native desktop application
 
@@ -14,15 +14,17 @@ python run_desktop.py
 
 If you used `setup.ps1`, you can run `.\.venv\Scripts\python.exe run_desktop.py` without changing your active Conda environment. macOS/Linux users can run `.venv/bin/python run_desktop.py` after `sh setup.sh`. [PySide6](https://pypi.org/project/PySide6/) supplies the native Qt widgets; [keyring](https://pypi.org/project/keyring/) supplies optional OS credential storage. The desktop launcher reports missing packages with the install command.
 
-The Main Menu has two starting paths. **New Game** invokes the existing Azgaar world generator, then uses the Phase 2A Gemini initializer to create and display a campaign opening for that exact world. It needs Chromium, internet access, and a Gemini API key saved in Settings or supplied through `GEMINI_API_KEY`; generation and the Gemini request run in a background worker, so the window stays responsive. The initialized world directory receives Phase 2A's validated `gamestate.json`, `notes.json`, and backup `world.base.json` in addition to the Phase 1 files. **Try Offline Demo** uses a fictional sample world and local placeholder text; it needs no browser, network, or API key. Character creation remains a mock placeholder until Phase 3A is integrated; accepted characters in the `playing` phase use the Phase 3B turn engine. Choose Settings to set Gemini/ElevenLabs keys, audio preferences, and user-writable folders for world exports and saves. When enabled, narration is generated and played asynchronously after the introduction appears; audio failures leave the campaign playable.
+From the Main Menu, choose **New Game** to generate an Azgaar world and initialize a Gemini campaign. Read the introduction, enter a freeform character description, and choose **Begin Adventure**. Gemini creates the character and the app opens gameplay. Enter freeform actions to receive narration and validated changes to inventory, quests, NPCs, and location. Nearby settlements appear in the sidebar; double-click one to prepare a travel action. Phase 3C checks land and water geometry before travel is committed. New Game needs Chromium, internet access, and a Gemini API key saved in Settings or supplied through `GEMINI_API_KEY`. **Try Offline Demo** remains a local mock with no browser, network, or API key.
+
+Choose **Save Game** during play. The save file is placed in the configured Saves folder and points to the authoritative world directory in the configured World Exports folder. To resume, choose **Load Game** and select that save file. Loading rereads the current `world.json`, `notes.json`, and `gamestate.json`, including turns committed after the pointer was created. Keep the world directory when moving a save to another computer; a pointer alone does not contain the campaign. Settings lets you change both writable folders. Enable ElevenLabs audio and save its key to hear the introduction, character opening, and gameplay narration; validated sound cues play afterward. Audio failure leaves the committed turn playable in text.
 
 Use the dedicated **Save Gemini Key** button in Settings to store a Gemini key with `keyring` in the operating system credential manager. The key is reloaded when the application starts and whenever Settings opens. **Clear Gemini Key** deletes that stored credential and clears the field. ElevenLabs has Save/Clear controls and uses `ELEVENLABS_API_KEY` when no saved key exists. Narration defaults to voice `Rachel` and model `eleven_multilingual_v2`; generated audio is cached in user-writable app data and never written to game JSON files. If no key is available, the application remains text-only.
 
 During New Game, the status line and console report elapsed time for loading the world, preparing the prompt, each Gemini request, parsing, validation, and saving. These messages contain stage names and durations only. The Gemini HTTP timeout is 45 seconds per request; the desktop allows at most two request attempts per proposal and two proposals if validation asks for a correction. The SDK's own automatic retries are disabled, so its internal retry count cannot multiply those limits. A standalone one-line API request may finish much faster than this structured campaign request. Press **Cancel** to stop between requests and before any campaign files are saved; an active HTTP request waits for its timeout.
 
-For the Phase 2 handoff, `desktop.services.GameService` defines `initialize_campaign(world, cancel)`, `create_character(intro, description, cancel)`, and `perform_action(session, action, cancel)`. `PhaseTwoCampaignService` is the active **New Game** adapter: it invokes `campaign_init.initialize_campaign_from_directory(...)` with the saved in-memory key. `AzgaarWorldProvider` adapts the existing callable `generate_world(...)`; `SampleWorldProvider` is only for the offline demo. `MainWindow` runs world and game calls in one Qt worker at a time, provides a cancellation event, disables duplicate controls while busy, and shows progress/errors. The service returns `CampaignIntro` and `GameSession` values; `GameSaveStore` persists narrative state separately from API credentials.
+The desktop adapter `PhaseTwoCampaignService` connects Phase 2 initialization, Phase 3A character creation, and Phase 3B turns with Phase 3C world effects. `AzgaarWorldProvider` adapts the existing `generate_world(...)` function; `SampleWorldProvider` is only for the offline demo. `MainWindow` runs network and generation calls in Qt workers and disables duplicate operations while busy. `GameSaveStore` keeps API credentials out of game saves.
 
-Phase 3B's `gameplay_turn.py` accepts natural-language actions for campaigns whose authoritative `gamestate.json` is in the `playing` phase with an accepted character. It validates Gemini's structured turn proposal, applies bounded player changes, dispatches registered Phase 3C world operations, and persists the turn through the existing rollback helper. The desktop service uses it for playing campaigns. Until Phase 3A character acceptance is merged, the current mock character screen still leads to mock gameplay. See [PHASE3B_CONTRACT.md](PHASE3B_CONTRACT.md) for the operation schema and integration signatures.
+Phase 3B's `gameplay_turn.py` validates Gemini's structured turn proposal, applies bounded player changes, delegates geography and world rules to Phase 3C, and saves the turn through the existing rollback helper. See [PHASE3B_CONTRACT.md](PHASE3B_CONTRACT.md) and [WORLD_INTERACTIONS.md](WORLD_INTERACTIONS.md) for the interfaces and travel constraints.
 
 Desktop smoke and interaction tests run without a live website or credential manager:
 
@@ -30,7 +32,7 @@ Desktop smoke and interaction tests run without a live website or credential man
 python -m unittest discover -s tests -p test_desktop.py -v
 ```
 
-These use Qt's offscreen platform and check startup, navigation, the mock campaign, worker responsiveness, cancellation, save/load, plain-text rendering, and key storage choices.
+These use Qt's offscreen platform and check startup, navigation, worker responsiveness, cancellation, save/load, plain-text rendering, and key storage choices. Run the full suite with `python -m unittest discover -s tests -v`; Phase 3 integration tests mock Gemini and ElevenLabs.
 
 ## Azgaar world exporter and geographic parser
 

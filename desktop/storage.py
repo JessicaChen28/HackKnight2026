@@ -10,7 +10,7 @@ from keyring.errors import PasswordDeleteError
 from PySide6.QtCore import QSettings, QStandardPaths
 
 from safe_storage import prepare_root, read_json, safe_name, write_json
-from desktop.services import GameSession, WorldRef
+from desktop.services import GameSession, WorldRef, session_from_campaign
 
 
 SERVICE_NAME = "SOLARRPG.FantasyRPG"
@@ -125,13 +125,41 @@ class GameSaveStore:
     def save(self, session: GameSession, root: Path | None = None) -> Path:
         root = prepare_root(root if root is not None else self.preferences.save_root())
         destination = root / f"{safe_name(session.world.name)}_{uuid4().hex}.json"
-        # This model contains narrative/game state only; no credential fields.
-        write_json(destination, {"schema_version": 1, "session": asdict(session)})
+        directory = session.world.directory
+        if directory:
+            if not (Path(directory) / "gamestate.json").is_file():
+                raise ValueError("Campaign files are missing; the game was not saved.")
+            # The world directory holds authoritative state. A save is a small
+            # pointer plus the two narration texts absent from Phase 2/3A JSON.
+            session_from_campaign(session.world, session.introduction,
+                                  session.character_description, session.character_narration)
+            write_json(destination, {"schema_version": 2, "world": asdict(session.world),
+                                     "introduction": session.introduction,
+                                     "character_description": session.character_description,
+                                     "character_narration": session.character_narration})
+        else:
+            write_json(destination, {"schema_version": 1, "session": asdict(session)})
         return destination
 
     def load(self, path: Path) -> GameSession:
         data = read_json(path, 2 * 1024 * 1024)
-        if not isinstance(data, dict) or data.get("schema_version") != 1:
+        if not isinstance(data, dict):
+            raise ValueError("This is not a supported game save.")
+        if data.get("schema_version") == 2:
+            world = data.get("world")
+            if not isinstance(world, dict) or not isinstance(world.get("name"), str) or not world["name"]:
+                raise ValueError("Game save has an invalid world reference.")
+            if not isinstance(world.get("directory"), str) or not world["directory"]:
+                raise ValueError("Game save has no campaign directory.")
+            if world.get("seed") is not None and not isinstance(world["seed"], str):
+                raise ValueError("Game save has an invalid world seed.")
+            for key in ("introduction", "character_description", "character_narration"):
+                if not isinstance(data.get(key), str) or len(data[key]) > 100_000:
+                    raise ValueError(f"Game save has invalid {key}.")
+            return session_from_campaign(
+                WorldRef(world["name"], world["directory"], world.get("seed")),
+                data["introduction"], data["character_description"], data["character_narration"])
+        if data.get("schema_version") != 1:
             raise ValueError("This is not a supported game save.")
         item = data.get("session")
         if not isinstance(item, dict) or not isinstance(item.get("world"), dict):
@@ -158,6 +186,14 @@ class GameSaveStore:
         turn = item.get("turn", 0)
         if type(turn) is not int or turn < 0:
             raise ValueError("Game save has an invalid turn counter.")
-        return GameSession(WorldRef(world["name"], world.get("directory"), world.get("seed")),
+        session = GameSession(WorldRef(world["name"], world.get("directory"), world.get("seed")),
                            *(item[key] for key in required_text),
                            inventory=item["inventory"], quests=item["quests"], history=history, turn=turn)
+        if session.world.directory and (Path(session.world.directory) / "gamestate.json").is_file():
+            character_narration = item.get("character_narration", "")
+            if not isinstance(character_narration, str):
+                raise ValueError("Game save has invalid character narration.")
+            return session_from_campaign(session.world, session.introduction,
+                                         session.character_description,
+                                         character_narration)
+        return session

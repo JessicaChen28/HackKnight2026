@@ -34,6 +34,12 @@ class CampaignIntro:
 
 
 @dataclass
+class CharacterRevision:
+    questions: list[str]
+    adjustments: list[dict] = field(default_factory=list)
+
+
+@dataclass
 class GameSession:
     world: WorldRef
     introduction: str
@@ -44,6 +50,97 @@ class GameSession:
     quests: list[str] = field(default_factory=list)
     history: list[dict[str, str]] = field(default_factory=list)
     turn: int = 0
+    character_narration: str = ""
+    npcs: list[str] = field(default_factory=list)
+    nearby: list[str] = field(default_factory=list)
+    last_narration: str = ""
+    audio_cues: dict = field(default_factory=dict)
+
+
+def session_from_campaign(world_ref: WorldRef, introduction: str, description: str,
+                          character_narration: str = "") -> GameSession:
+    """Build the desktop view from committed campaign files, including on reload."""
+    from safe_storage import read_json
+
+    if not world_ref.directory:
+        raise GameError("This campaign has no saved world directory.")
+    directory = Path(world_ref.directory)
+    world = read_json(directory / "world.json")
+    state = read_json(directory / "gamestate.json")
+    if not isinstance(world, dict) or not isinstance(state, dict) or state.get("phase") != "playing":
+        raise GameError("This campaign has no accepted character to resume.")
+    metadata = world.get("metadata")
+    if not isinstance(metadata, dict) or (
+        world_ref.seed is not None and str(metadata.get("seed")) != world_ref.seed):
+        raise GameError("The saved world reference does not match this campaign.")
+    player, campaign = state.get("player"), state.get("campaign")
+    if not isinstance(player, dict) or not isinstance(campaign, dict):
+        raise GameError("This campaign's character or location is unavailable.")
+    name = player.get("name")
+    if not isinstance(name, str) or not name.strip():
+        raise GameError("This campaign's character name is invalid.")
+    burgs = [burg for burg in world.get("pack", {}).get("burgs", []) if isinstance(burg, dict)]
+    current = campaign.get("current_location") or campaign.get("starting_location") or {}
+    current_id = current.get("burg_id") if isinstance(current, dict) else None
+    place = next((burg for burg in burgs if burg.get("i") == current_id), None)
+    location = (current.get("name") if isinstance(current, dict) else None) or (
+        place.get("name") if place else None) or "Unknown settlement"
+    inventory = []
+    for item in player.get("inventory", []):
+        if isinstance(item, str):
+            inventory.append(item)
+        elif isinstance(item, dict) and isinstance(item.get("name"), str):
+            quantity = item.get("quantity", 1)
+            inventory.append(f"{quantity} × {item['name']}" if quantity != 1 else item["name"])
+    quests = []
+    for key, quest in state.get("quests", {}).items():
+        if not isinstance(quest, dict) or quest.get("status") in ("completed", "failed", "abandoned"):
+            continue
+        progress = ""
+        if isinstance(quest.get("objectives"), list):
+            progress = f", {len(quest.get('completed_objectives', []))}/{len(quest['objectives'])} objectives"
+        quests.append(f"{quest.get('title', key)} ({quest.get('status', 'available')}{progress})")
+    npcs = []
+    for key, npc in state.get("npcs", {}).items():
+        if not isinstance(npc, dict):
+            continue
+        relation = npc.get("player_relationship")
+        whereabouts = "here" if npc.get("location_burg_id") == current_id else "elsewhere"
+        detail = f"{npc.get('role', 'local')}, {whereabouts}, {npc.get('status', 'active')}"
+        if isinstance(relation, str):
+            detail += f", {relation}"
+        npcs.append(f"{npc.get('name', key)} — {detail}")
+    nearby = []
+    if place and isinstance(place.get("x"), (int, float)) and isinstance(place.get("y"), (int, float)):
+        candidates = [burg for burg in burgs if burg.get("i") != current_id
+                      and isinstance(burg.get("x"), (int, float))
+                      and isinstance(burg.get("y"), (int, float))]
+        candidates.sort(key=lambda burg: (burg["x"] - place["x"]) ** 2 + (burg["y"] - place["y"]) ** 2)
+        nearby = [f"{burg.get('name', 'Settlement')} (ID {burg['i']})" for burg in candidates[:8]]
+    history = []
+    if introduction:
+        history.append({"speaker": "Narrator", "text": introduction})
+    if character_narration:
+        history.append({"speaker": "Narrator", "text": character_narration})
+    npc_names = {key: npc.get("name", key) for key, npc in state.get("npcs", {}).items()
+                 if isinstance(npc, dict)}
+    for event in state.get("history", []):
+        if not isinstance(event, dict) or not isinstance(event.get("text"), str):
+            continue
+        kind = event.get("type")
+        if kind == "player_action":
+            history.append({"speaker": "You", "text": event["text"]})
+        elif kind == "narration":
+            history.append({"speaker": "Narrator", "text": event["text"]})
+        elif kind == "dialogue":
+            history.append({"speaker": str(npc_names.get(event.get("speaker_id"), event.get("speaker_id", "NPC"))),
+                            "text": event["text"]})
+    turn = campaign.get("current_turn")
+    if type(turn) is not int or turn < 0:
+        raise GameError("This campaign's turn counter is invalid.")
+    return GameSession(world_ref, introduction, description, name, str(location),
+                       inventory, quests, history, turn, character_narration,
+                       npcs, nearby)
 
 
 class WorldProvider(Protocol):
@@ -52,7 +149,8 @@ class WorldProvider(Protocol):
 
 class GameService(Protocol):
     def initialize_campaign(self, world: WorldRef, cancel: Event) -> CampaignIntro: ...
-    def create_character(self, intro: CampaignIntro, description: str, cancel: Event) -> GameSession: ...
+    def create_character(self, intro: CampaignIntro, description: str,
+                         cancel: Event) -> GameSession | CharacterRevision: ...
     def perform_action(self, session: GameSession, action: str, cancel: Event) -> GameSession: ...
 
 
@@ -133,7 +231,7 @@ class MockGameService:
 
 
 class PhaseTwoCampaignService:
-    """Use Phase 2A for the opening, while later gameplay remains a mock.
+    """Connect the established campaign, character and turn services.
 
     The API key is deliberately supplied by a callable owned by the desktop
     credential service. It is never read from settings files or game saves by
@@ -196,9 +294,25 @@ class PhaseTwoCampaignService:
             raise GameError("Gemini returned an empty campaign introduction. Please retry.")
         return CampaignIntro(world, message.strip())
 
-    def create_character(self, intro: CampaignIntro, description: str, cancel: Event) -> GameSession:
-        """Placeholder until the Phase 2 character-creation service is ready."""
-        return self._placeholder.create_character(intro, description, cancel)
+    def create_character(self, intro: CampaignIntro, description: str, cancel: Event,
+                         progress: Progress | None = None) -> GameSession | CharacterRevision:
+        if not intro.world.directory:
+            return self._placeholder.create_character(intro, description, cancel)
+        from character_creation import ACCEPTED, NEEDS_REVISION, create_character
+
+        key = self._api_key().strip()
+        if not key:
+            raise GameError("Save a Gemini API key in Settings to create a character.")
+        result = create_character(description, Path(intro.world.directory), api_key=key,
+                                  progress=progress, cancel_event=cancel)
+        if result.status == NEEDS_REVISION:
+            return CharacterRevision(result.questions, result.adjustments)
+        if result.status != ACCEPTED:
+            raise GameError(result.error or "Gemini could not create this character.")
+        session = session_from_campaign(intro.world, intro.text, description,
+                                        character_narration=result.narration)
+        session.last_narration = result.narration
+        return session
 
     def perform_action(self, session: GameSession, action: str, cancel: Event,
                        progress: Progress | None = None) -> GameSession:
@@ -209,31 +323,31 @@ class PhaseTwoCampaignService:
         from safe_storage import read_json
         state = read_json(Path(directory) / "gamestate.json")
         if state.get("phase") != "playing":
-            return self._placeholder.perform_action(session, action, cancel)
-        from campaign_init import GeminiClient
+            raise GameError("This campaign is not ready for gameplay.")
+        from campaign_init import CampaignInitError, GeminiClient
         from gameplay_turn import TurnError, process_turn
 
         key = self._api_key().strip()
         if not key:
             raise GameError("Save a Gemini API key in Settings to continue the campaign.")
-        client = GeminiClient(api_key=key, progress=progress, cancel_event=cancel)
+        try:
+            client = GeminiClient(api_key=key, progress=progress, cancel_event=cancel)
+        except CampaignInitError as error:
+            if str(error).startswith("Install the SDK:"):
+                raise GameError("Gemini support is not installed. Run: python -m pip install -r requirements.txt") from error
+            raise GameError("Gemini is unavailable for this campaign.") from error
         try:
             result = process_turn(directory, action, client=client, expected_turn=session.turn,
                                   cancel_event=cancel, progress=progress)
         except TurnError as error:
             raise GameError(str(error)) from error
         finally:
-            client.close()
-        updated = deepcopy(session)
-        updated.turn = result.turn
-        updated.history.append({"speaker": "You", "text": action.strip()})
-        updated.history.append({"speaker": "Narrator", "text": result.narration})
-        updated.history.extend({"speaker": entry["speaker_id"], "text": entry["text"]}
-                               for entry in result.dialogue)
-        inventory = result.player.get("inventory")
-        if isinstance(inventory, list) and all(isinstance(item, str) for item in inventory):
-            updated.inventory = inventory
-        if result.location:
-            updated.location = result.location
-        updated.quests = list(result.quests)
+            try:
+                client.close()
+            except Exception:
+                pass  # A committed turn stays successful if transport shutdown fails.
+        updated = session_from_campaign(session.world, session.introduction,
+                                        session.character_description, session.character_narration)
+        updated.last_narration = result.narration
+        updated.audio_cues = result.audio_cues
         return updated
