@@ -14,13 +14,14 @@ class FakeTTS:
     def convert(self, **kwargs):
         self.calls += 1
         self.last_voice = kwargs.get("voice_id")
+        self.last_kwargs = kwargs
         return [b"ID3", b" audio"]
 
 
 class FakeClient:
     def __init__(self):
         self.text_to_speech = FakeTTS()
-        self.sound_generation = FakeTTS()
+        self.text_to_sound_effects = FakeTTS()
         self.voices = type("Voices", (), {"get_all": lambda self: type("Result", (), {
             "voices": [type("Voice", (), {"name": "Rachel", "voice_id": "validVoiceId123456"})()]
         })()})()
@@ -78,9 +79,74 @@ class AudioTests(unittest.TestCase):
         with TemporaryDirectory() as root:
             client = FakeClient()
             service = ElevenLabsAudioService("test-key", Path(root), client=client)
-            service.play_sound_effect("rain on a tin roof")
-            service.play_sound_effect("rain on a tin roof")
-            self.assertEqual(client.sound_generation.calls, 1)
+            effect = service.play_sound_effect("rain on a tin roof")
+            self.assertEqual(effect.read_bytes(), b"ID3 audio")
+            self.assertEqual(effect.suffix, ".mp3")
+            service.voice_id = "anotherVoiceId12345"
+            service.model = "another_tts_model"
+            self.assertEqual(service.play_sound_effect("rain on a tin roof"), effect)
+            self.assertEqual(client.text_to_sound_effects.calls, 1)
+            self.assertEqual(client.text_to_sound_effects.last_kwargs["model_id"], "eleven_text_to_sound_v2")
+
+    def test_failed_sfx_is_not_retried_and_tts_still_works(self):
+        with TemporaryDirectory() as root:
+            client = FakeClient()
+            calls = []
+
+            def broken(**kwargs):
+                calls.append(kwargs)
+                raise AttributeError("sound method failed")
+
+            client.text_to_sound_effects.convert = broken
+            service = ElevenLabsAudioService("test-key", Path(root), client=client)
+            with self.assertRaises(AudioError):
+                service.play_sound_effect("warning bell")
+            with self.assertRaisesRegex(AudioError, "failed earlier"):
+                service.play_sound_effect("warning bell")
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(service.speak_narration("continue story").read_bytes(), b"ID3 audio")
+            self.assertFalse(list(Path(root).glob("*.part")))
+
+    def test_sfx_api_error_is_distinguished_from_local_error(self):
+        class ApiErrorLike(Exception):
+            status_code = 429
+            body = {"detail": {"status": "quota_exceeded", "message": "quota exhausted"}}
+
+        with TemporaryDirectory() as root:
+            client = FakeClient()
+            calls = []
+
+            def reject(**kwargs):
+                calls.append(kwargs)
+                raise ApiErrorLike("provider error")
+
+            client.text_to_sound_effects.convert = reject
+            service = ElevenLabsAudioService("test-key", Path(root), client=client)
+            with patch("builtins.print") as printed:
+                with self.assertRaises(AudioError):
+                    service.play_sound_effect("wind")
+            output = " ".join(str(call) for call in printed.call_args_list)
+            self.assertIn("sound effect API failed", output)
+            self.assertIn("quota/rate limit", output)
+            self.assertNotIn("test-key", output)
+            with self.assertRaises(AudioError):
+                service.play_sound_effect("wind")
+            self.assertEqual(len(calls), 1)
+
+    def test_partial_sfx_response_does_not_enter_cache(self):
+        with TemporaryDirectory() as root:
+            client = FakeClient()
+
+            def broken(**kwargs):
+                yield b"ID3"
+                raise RuntimeError("stream interrupted")
+
+            client.text_to_sound_effects.convert = broken
+            service = ElevenLabsAudioService("test-key", Path(root), client=client)
+            with self.assertRaises(AudioError):
+                service.play_sound_effect("wind")
+            self.assertFalse(list(Path(root).glob("*.mp3")))
+            self.assertFalse(list(Path(root).glob("*.part")))
 
 
 if __name__ == "__main__":

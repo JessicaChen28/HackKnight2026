@@ -18,6 +18,7 @@ from campaign_init import (CampaignInitError, GeminiClient, build_world_brief,
                            parse_model_json, save_all)
 from safe_storage import checked_path, read_json
 from world_operations import WorldDispatcher, parse_operation, operation_kind
+from world_interactions import OP_FIELDS, WorldOperationError, apply_world_operations
 
 
 class TurnError(ValueError):
@@ -46,8 +47,7 @@ Return exactly one JSON object with this shape:
 {
   "narration": "What the player experiences after this attempt",
   "dialogue": [{"speaker_id": "existing NPC key", "text": "spoken words"}],
-  "player_changes": {"health_delta": 0, "inventory_add": [], "inventory_remove": [],
-                     "conditions_add": [], "conditions_remove": []},
+  "player_changes": {"inventory_add": [], "inventory_remove": []},
   "operations": [],
   "dm_note": "Private continuity note, or empty string",
   "audio_cues": {"sfx": [], "ambience": null},
@@ -57,6 +57,9 @@ Optional keys may be omitted except narration. Allowed operations and their
 typed fields are listed in the user context. Only propose an operation when
 its handler is available. Do not invent JSON patches, new NPC IDs, or world
 facts that need an unavailable handler. Audio cues are descriptions only.
+Inventory entries must follow the current character's inventory format.
+For object inventory, additions use {"name": "...", "quantity": 1,
+"description": "optional"} and removals use existing item names.
 Never include private DM notes or secrets in narration or dialogue."""
 
 
@@ -119,20 +122,47 @@ def _string_list(value: object, label: str, *, maximum: int = 20, item_limit: in
 
 
 def _prompt(world: dict, gamestate: dict, notes: dict, action: str,
-            available_operations: tuple[str, ...]) -> str:
+            available_operations: tuple[str, ...], legacy: bool = False) -> str:
     brief = build_world_brief(world, max_burgs=60)
     state_brief = {key: gamestate.get(key) for key in ("phase", "player", "campaign", "npcs", "quests")}
     state_brief["recent_history"] = gamestate.get("history", [])[-12:]
     notes_brief = {key: notes.get(key) for key in ("campaign", "established_lore", "plot_threads", "secrets")}
     notes_brief["recent_events"] = notes.get("event_log", [])[-12:]
     notes_brief["recent_turn_notes"] = notes.get("turn_notes", [])[-8:]
+    current = (gamestate.get("campaign") or {}).get("current_location") or (
+        gamestate.get("campaign") or {}).get("starting_location") or {}
+    burgs = [b for b in world.get("pack", {}).get("burgs", []) if isinstance(b, dict)]
+    origin = next((b for b in burgs if b.get("i") == current.get("burg_id")), None)
+    if origin:
+        burgs.sort(key=lambda b: (b.get("x", 0) - origin.get("x", 0)) ** 2
+                   + (b.get("y", 0) - origin.get("y", 0)) ** 2)
+    named = [b for b in burgs if isinstance(b.get("name"), str)
+             and b["name"].casefold() in action.casefold()]
+    nearby = list({b["i"]: b for b in named + burgs[:50] if "i" in b}.values())
+    destinations = [{key: b.get(key) for key in ("i", "name", "x", "y", "state", "feature", "port")}
+                    for b in nearby]
+    if legacy:
+        specification = ("travel_request uses destination_burg_id OR direction and distance; "
+                         "npc_interaction uses npc_id and intent; quest_update uses quest_id and event; "
+                         "world_event uses description.")
+    else:
+        specification = ("Use Phase 3C operation types and required fields: "
+                         + json.dumps({kind: {"required": sorted(fields[0]),
+                                              "optional": sorted(fields[1])}
+                                       for kind, fields in OP_FIELDS.items()})
+                         + ". "
+                           "Do not supply an id; the backend assigns a stable turn operation ID. "
+                           "Travel needs destination_burg_id, mode (walk, ride, ship, teleport), "
+                           "and realistic duration_days. A ship or border crossing needs "
+                           "route_justification; a border also needs border_strategy. "
+                           "Quest progress needs objective_index. Resolve only effects supported "
+                           "by the available operations; use [] if there is no world change.")
     return ("AUTHORITATIVE WORLD BRIEF:\n" + json.dumps(brief, separators=(",", ":"))
             + "\nGAMESTATE:\n" + json.dumps(state_brief, separators=(",", ":"))
             + "\nDM NOTES:\n" + json.dumps(notes_brief, separators=(",", ":"))
+            + "\nCURRENT AND NEARBY SETTLEMENTS:\n" + json.dumps(destinations, separators=(",", ":"))
             + "\nAVAILABLE WORLD OPERATIONS:\n" + json.dumps(available_operations)
-            + "\nOperation parameters: travel_request uses destination_burg_id OR direction and distance; "
-              "npc_interaction uses npc_id and intent; quest_update uses quest_id and event; "
-              "world_event uses description. Return operations: [] for actions without a supported world effect."
+            + "\nOperation parameters: " + specification
             + "\nPLAYER ATTEMPT:\n" + action)
 
 
@@ -140,7 +170,8 @@ def _apply_player_changes(proposal: object, player: dict) -> None:
     if proposal is None:
         return
     if not isinstance(proposal, dict) or set(proposal) - {
-        "health_delta", "inventory_add", "inventory_remove", "conditions_add", "conditions_remove"
+        "health_delta", "inventory_add", "inventory_remove", "conditions_add", "conditions_remove",
+        "status_condition"
     }:
         raise TurnError("Player changes contain unsupported fields.")
     delta = proposal.get("health_delta")
@@ -156,27 +187,61 @@ def _apply_player_changes(proposal: object, player: dict) -> None:
             if new_health < 0 or (maximum is not None and (type(maximum) is not int or new_health > maximum)):
                 raise TurnError("Health change exceeds the character's bounds.")
             player["health"] = new_health
+    condition = proposal.get("status_condition")
+    if condition is not None:
+        if not isinstance(player.get("status"), dict):
+            raise TurnError("Character has no compatible status field.")
+        player["status"]["condition"] = _text(condition, "Status condition", 100)
     for field, add_key, remove_key in (
         ("inventory", "inventory_add", "inventory_remove"),
         ("conditions", "conditions_add", "conditions_remove"),
     ):
         if add_key not in proposal and remove_key not in proposal:
             continue
+        additions_raw, removals_raw = proposal.get(add_key, []), proposal.get(remove_key, [])
+        if not additions_raw and not removals_raw and player.get(field) is None:
+            continue
         current = player.get(field)
-        if not isinstance(current, list) or any(not isinstance(item, str) for item in current):
+        if not isinstance(current, list):
             raise TurnError(f"Character has no compatible {field} list.")
-        additions = _string_list(proposal.get(add_key, []), add_key)
-        removals = _string_list(proposal.get(remove_key, []), remove_key)
-        if set(additions) & set(removals) or any(item in current for item in additions) or any(item not in current for item in removals):
-            raise TurnError(f"Invalid {field} addition or removal.")
-        updated = [item for item in current if item not in removals] + additions
+        removals = _string_list(removals_raw, remove_key)
+        if field == "inventory" and ((current and all(isinstance(item, dict) for item in current))
+                                     or (not current and isinstance(player.get("status"), dict))):
+            names = [_text(item.get("name"), "Inventory item name", 100) for item in current]
+            if len(set(names)) != len(names) or not isinstance(additions_raw, list) or len(additions_raw) > 20:
+                raise TurnError("Character inventory is invalid.")
+            additions = []
+            for item in additions_raw:
+                if not isinstance(item, dict) or set(item) - {"name", "quantity", "description"}:
+                    raise TurnError("Inventory addition must be an item object.")
+                name = _text(item.get("name"), "Inventory item name", 100)
+                quantity = item.get("quantity", 1)
+                if type(quantity) is not int or not 1 <= quantity <= 99:
+                    raise TurnError("Inventory quantity is invalid.")
+                clean = {"name": name, "quantity": quantity}
+                if "description" in item:
+                    clean["description"] = _text(item["description"], "Inventory description", 300)
+                additions.append(clean)
+            added_names = [item["name"] for item in additions]
+            if len(set(added_names)) != len(added_names) or set(added_names) & set(removals) or (
+                set(added_names) & set(names)) or not set(removals) <= set(names):
+                raise TurnError("Invalid inventory addition or removal.")
+            updated = [item for item in current if item["name"] not in removals] + additions
+        else:
+            if any(not isinstance(item, str) for item in current):
+                raise TurnError(f"Character has no compatible {field} list.")
+            additions = _string_list(additions_raw, add_key)
+            if set(additions) & set(removals) or any(item in current for item in additions) or any(item not in current for item in removals):
+                raise TurnError(f"Invalid {field} addition or removal.")
+            updated = [item for item in current if item not in removals] + additions
         if len(updated) > 200:
             raise TurnError(f"Character {field} exceeds the supported size.")
         player[field] = updated
 
 
 def _validate_proposal(response: dict, world: dict, gamestate: dict, notes: dict,
-                       dispatcher: WorldDispatcher, next_turn: int, action: str) -> tuple[dict, dict, dict, TurnResult]:
+                       dispatcher: WorldDispatcher | None, next_turn: int, action: str,
+                       coastlines: dict | None = None) -> tuple[dict, dict, dict, TurnResult]:
     allowed = {"narration", "dialogue", "player_changes", "operations", "dm_note", "audio_cues", "status"}
     if set(response) - allowed:
         raise TurnError("Turn response contains unsupported fields.")
@@ -192,8 +257,6 @@ def _validate_proposal(response: dict, world: dict, gamestate: dict, notes: dict
         if not isinstance(entry, dict) or set(entry) != {"speaker_id", "text"}:
             raise TurnError("Dialogue entry is invalid.")
         speaker = _text(entry["speaker_id"], "Dialogue speaker", 80)
-        if speaker not in gamestate.get("npcs", {}):
-            raise TurnError("Dialogue references an unknown NPC.")
         clean_dialogue.append({"speaker_id": speaker, "text": _text(entry["text"], "Dialogue", 2000)})
     cues = response.get("audio_cues", {})
     if not isinstance(cues, dict) or set(cues) - {"sfx", "ambience"}:
@@ -206,27 +269,40 @@ def _validate_proposal(response: dict, world: dict, gamestate: dict, notes: dict
     operations = response.get("operations", [])
     if not isinstance(operations, list) or len(operations) > 8:
         raise TurnError("World operations must be a short list.")
-    parsed_operations = [parse_operation(operation) for operation in operations]
-    valid_burgs = {burg["i"] for burg in world.get("pack", {}).get("burgs", []) if isinstance(burg, dict)}
-    for operation in parsed_operations:
-        kind = operation_kind(operation)
-        if kind not in dispatcher.available_kinds():
-            raise TurnError(f"No world handler is available for {kind}.")
-        if kind == "travel_request" and operation.destination_burg_id is not None and operation.destination_burg_id not in valid_burgs:
-            raise TurnError("Travel references an unknown settlement.")
-        if kind == "npc_interaction" and operation.npc_id not in gamestate.get("npcs", {}):
-            raise TurnError("NPC interaction references an unknown NPC.")
-        if kind == "quest_update" and operation.quest_id not in gamestate.get("quests", {}):
-            raise TurnError("Quest update references an unknown quest.")
     next_world, next_state, next_notes = deepcopy((world, gamestate, notes))
     _apply_player_changes(response.get("player_changes"), next_state["player"])
-    events = []
-    for operation in parsed_operations:
-        outcome = dispatcher.dispatch(operation, next_world, next_state, next_notes)
-        events.append({"type": operation_kind(operation), "request": asdict(operation),
-                       "summary": outcome.summary, "details": list(outcome.events)})
-    campaign = next_state["campaign"]
-    campaign["current_turn"] = next_turn
+    next_state["campaign"]["current_turn"] = next_turn
+    world_cues = []
+    if dispatcher is None:
+        enriched = []
+        for ordinal, operation in enumerate(operations, 1):
+            if not isinstance(operation, dict) or "id" in operation:
+                raise TurnError("World operations must be objects without model-assigned IDs.")
+            enriched.append({**operation, "id": f"turn_{next_turn}_op_{ordinal}"})
+        outcome = apply_world_operations(next_world, next_notes, next_state, enriched,
+                                         coastlines=coastlines)
+        next_world, next_notes, next_state = outcome.world, outcome.notes, outcome.gamestate
+        events, world_cues = outcome.events, outcome.audio_cues
+    else:
+        parsed_operations = [parse_operation(operation) for operation in operations]
+        valid_burgs = {burg["i"] for burg in world.get("pack", {}).get("burgs", []) if isinstance(burg, dict)}
+        for operation in parsed_operations:
+            kind = operation_kind(operation)
+            if kind not in dispatcher.available_kinds():
+                raise TurnError(f"No world handler is available for {kind}.")
+            if kind == "travel_request" and operation.destination_burg_id is not None and operation.destination_burg_id not in valid_burgs:
+                raise TurnError("Travel references an unknown settlement.")
+            if kind == "npc_interaction" and operation.npc_id not in gamestate.get("npcs", {}):
+                raise TurnError("NPC interaction references an unknown NPC.")
+            if kind == "quest_update" and operation.quest_id not in gamestate.get("quests", {}):
+                raise TurnError("Quest update references an unknown quest.")
+        events = []
+        for operation in parsed_operations:
+            outcome = dispatcher.dispatch(operation, next_world, next_state, next_notes)
+            events.append({"type": operation_kind(operation), "request": asdict(operation),
+                           "summary": outcome.summary, "details": list(outcome.events)})
+    if any(entry["speaker_id"] not in next_state.get("npcs", {}) for entry in clean_dialogue):
+        raise TurnError("Dialogue references an unknown NPC.")
     history = next_state.setdefault("history", [])
     if not isinstance(history, list):
         raise TurnError("Campaign history is invalid.")
@@ -239,13 +315,15 @@ def _validate_proposal(response: dict, world: dict, gamestate: dict, notes: dict
             raise TurnError("DM turn notes are invalid.")
         turn_notes.append({"turn": next_turn, "text": note})
     player = next_state["player"]
-    location = player.get("location") or next_state.get("location")
+    place = next_state["campaign"].get("current_location") or next_state["campaign"].get("starting_location")
+    location = (place.get("name") if isinstance(place, dict) else None) or player.get("location") or next_state.get("location")
     if location is not None and not isinstance(location, str):
         location = None
     quests = tuple(str(quest.get("title", key)) for key, quest in next_state.get("quests", {}).items()
                    if isinstance(quest, dict) and quest.get("status") != "completed")
     result = TurnResult(next_turn, narration, tuple(clean_dialogue), tuple(events),
-                        {"sfx": sfx, "ambience": ambience}, status, deepcopy(player), location, quests)
+                        {"sfx": sfx, "ambience": ambience, "world_cues": world_cues},
+                        status, deepcopy(player), location, quests)
     return next_world, next_state, next_notes, result
 
 
@@ -264,7 +342,6 @@ def process_turn(directory: str | Path, player_action: str, *, client=None,
     directory = checked_path(directory)
     if not directory.is_dir():
         raise TurnError("Campaign directory does not exist.")
-    dispatcher = dispatcher or WorldDispatcher()
     own_client = client is None
     with _turn_lock(directory):
         _check_cancelled(cancel_event)
@@ -280,7 +357,11 @@ def process_turn(directory: str | Path, player_action: str, *, client=None,
         if expected_turn is not None and current_turn != expected_turn:
             raise TurnError("Stale turn: the campaign has advanced.")
         next_turn = current_turn + 1
-        turns = [("user", _prompt(world, gamestate, notes, action, dispatcher.available_kinds()))]
+        coastlines_path = directory / "coastlines.json"
+        coastlines = read_json(coastlines_path) if coastlines_path.is_file() else None
+        kinds = dispatcher.available_kinds() if dispatcher is not None else tuple(OP_FIELDS)
+        turns = [("user", _prompt(world, gamestate, notes, action, kinds,
+                                  legacy=dispatcher is not None))]
         if own_client:
             client = GeminiClient(progress=progress, cancel_event=cancel_event)
         try:
@@ -303,7 +384,7 @@ def process_turn(directory: str | Path, player_action: str, *, client=None,
                 try:
                     proposal = parse_model_json(raw)
                     next_world, next_state, next_notes, result = _validate_proposal(
-                        proposal, world, gamestate, notes, dispatcher, next_turn, action)
+                        proposal, world, gamestate, notes, dispatcher, next_turn, action, coastlines)
                 except (ValueError, TypeError, KeyError) as error:
                     if attempt == max_proposals:
                         raise TurnError("Gemini returned an invalid turn after the allowed proposals; no state was saved.") from error
@@ -321,7 +402,10 @@ def process_turn(directory: str | Path, player_action: str, *, client=None,
                     changed["world.json"] = (next_world, True)
                 save_all(directory, changed)
                 if progress:
-                    progress(f"Turn {next_turn} saved.")
+                    try:
+                        progress(f"Turn {next_turn} saved.")
+                    except Exception:
+                        pass  # A UI callback cannot undo an already committed turn.
                 return result
         finally:
             if own_client:

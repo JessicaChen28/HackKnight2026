@@ -9,14 +9,14 @@ from uuid import uuid4
 from threading import Event
 from typing import Callable
 
-from PySide6.QtCore import QObject, QThread, QTimer, Qt, Signal, Slot
+from PySide6.QtCore import QObject, QSize, QThread, QTimer, Qt, Signal, Slot
 from PySide6.QtWidgets import (QFileDialog, QHBoxLayout, QLabel, QMainWindow,
                                QProgressBar, QPushButton, QStackedWidget, QVBoxLayout, QWidget)
 
 from desktop.screens import CharacterCreationScreen, GameplayScreen, MainMenuScreen, SettingsScreen
 from desktop.audio import AudioError, AudioPlayback, ElevenLabsAudioService
 from desktop.services import (AzgaarWorldProvider, CampaignIntro, GameError, GameService,
-                              GameSession, MockGameService, PhaseTwoCampaignService,
+                              GameSession, CharacterRevision, MockGameService, PhaseTwoCampaignService,
                               SampleWorldProvider, WorldProvider, WorldRef)
 from desktop.storage import ApiKeyVault, GameSaveStore, Preferences
 
@@ -28,19 +28,29 @@ class CampaignPromotionError(GameError):
     """A completed campaign could not be published, but remains recoverable."""
 
 
+class ResponsiveStack(QStackedWidget):
+    """Allow the window to shrink to the active screen instead of its tallest page."""
+
+    def minimumSizeHint(self) -> QSize:
+        return QSize(0, 0)
+
+
 class TaskWorker(QObject):
     succeeded = Signal(object)
     failed = Signal(str)
     progressed = Signal(str)
     done = Signal()
 
-    def __init__(self, task: Task, cancel: Event):
+    def __init__(self, task: Task, cancel: Event, task_id: int):
         super().__init__()
         self.task = task
         self.cancel = cancel
+        self.task_id = task_id
 
     @Slot()
     def run(self) -> None:
+        if os.environ.get("SOLAR_RPG_DEVELOPMENT") == "1":
+            print(f"Desktop task {self.task_id}: worker started on thread {QThread.currentThread().objectName()}.", flush=True)
         try:
             self.succeeded.emit(self.task(self.cancel, self.progressed.emit))
         except (GameError, ValueError) as error:
@@ -50,9 +60,11 @@ class TaskWorker(QObject):
             # future service exception might contain a request/API credential.
             self.failed.emit(f"Operation failed ({type(error).__name__}). Please retry.")
             if os.environ.get("SOLAR_RPG_DEVELOPMENT") == "1":
-                print(f"Desktop task exception: {type(error).__name__}: {str(error)[:500]}", flush=True)
-                traceback.print_exc()
+                print(f"Desktop task exception: {type(error).__name__}", flush=True)
+                print("".join(traceback.format_tb(error.__traceback__)), flush=True)
         finally:
+            if os.environ.get("SOLAR_RPG_DEVELOPMENT") == "1":
+                print(f"Desktop task {self.task_id}: worker emitted done.", flush=True)
             self.done.emit()
 
 
@@ -70,9 +82,7 @@ class MainWindow(QMainWindow):
         self.vault = vault or ApiKeyVault(self.preferences.settings)
         self.world_provider = world_provider or AzgaarWorldProvider()
         self.sample_provider = sample_provider or SampleWorldProvider()
-        # Phase 2A owns only the campaign opening. Character creation and play
-        # intentionally remain mock placeholders until their Phase 2 services
-        # arrive. The vault supplies the key in memory, never via a save file.
+        # The vault supplies the key in memory, never via a save file.
         self.game_service = game_service or PhaseTwoCampaignService(
             self.vault.gemini_key)
         self.demo_game_service = demo_game_service or MockGameService()
@@ -90,13 +100,19 @@ class MainWindow(QMainWindow):
         self._worker: TaskWorker | None = None
         self._cancel: Event | None = None
         self._callback: Callable[[object], None] | None = None
+        self._next_task_id = 0
+        self._active_task_id: int | None = None
+        # Keep Python wrappers alive through Qt's deferred deletion after
+        # QThread.finished. Releasing the worker in _task_finished was unsafe.
+        self._retired_tasks: dict[int, tuple[QThread, TaskWorker]] = {}
         self._closing = False
         self._pending_narration: tuple[str, str] | None = None
+        self._pending_audio_cues: dict | None = None
 
         root = QWidget()
         outer = QVBoxLayout(root)
         outer.setContentsMargins(0, 0, 0, 0)
-        self.stack = QStackedWidget()
+        self.stack = ResponsiveStack()
         outer.addWidget(self.stack, 1)
         self.menu = MainMenuScreen()
         self.creation = CharacterCreationScreen()
@@ -142,6 +158,8 @@ class MainWindow(QMainWindow):
         self.game.menu_button.clicked.connect(self.show_menu)
         self.game.save_button.clicked.connect(self.save_game)
         self.game.send_button.clicked.connect(self.take_action)
+        self.game.nearby.itemDoubleClicked.connect(self.prepare_travel)
+        self.game.npcs.itemDoubleClicked.connect(self.prepare_conversation)
         self.settings_screen.back_button.clicked.connect(self.show_menu)
         self.settings_screen.save_button.clicked.connect(self.save_settings)
         self.settings_screen.save_gemini_button.clicked.connect(self.save_gemini_key)
@@ -153,6 +171,10 @@ class MainWindow(QMainWindow):
         self.cancel_button.clicked.connect(self.cancel_operation)
         if self.vault.warnings:
             self._show_error(" ".join(self.vault.warnings))
+        elif not self.preferences.settings.value("app/first_run_complete", False, type=bool):
+            self._show_message("Welcome to SOLAR RPG. Open Settings to add your Gemini and optional ElevenLabs keys.")
+            self.preferences.settings.setValue("app/first_run_complete", True)
+            self.preferences.settings.sync()
 
     def _set_busy(self, busy: bool, label: str = "") -> None:
         for control in self._controls:
@@ -182,32 +204,59 @@ class MainWindow(QMainWindow):
             return False
         self._cancel = Event()
         self._callback = callback
+        self._next_task_id += 1
+        task_id = self._next_task_id
+        self._active_task_id = task_id
         thread = QThread(self)
-        worker = TaskWorker(task, self._cancel)
+        thread.setObjectName(f"solar-task-{task_id}")
+        worker = TaskWorker(task, self._cancel, task_id)
         worker.moveToThread(thread)
         self._thread, self._worker = thread, worker
+        self._retired_tasks[task_id] = (thread, worker)
         thread.started.connect(worker.run)
         worker.progressed.connect(self._show_message)
         worker.succeeded.connect(self._task_succeeded)
         worker.failed.connect(self._show_error)
         worker.done.connect(thread.quit)
-        thread.finished.connect(self._task_finished)
         thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(self._task_finished)
         thread.finished.connect(thread.deleteLater)
+        thread.destroyed.connect(lambda *_args, identity=task_id: self._release_task(identity))
+        self._task_diagnostic(f"task {task_id} started; GUI thread={QThread.currentThread() == self.thread()}")
         self._set_busy(True, label)
         thread.start()
         return True
+
+    @staticmethod
+    def _task_diagnostic(message: str) -> None:
+        if os.environ.get("SOLAR_RPG_DEVELOPMENT") == "1":
+            print(f"Desktop lifecycle: {message}", flush=True)
+
+    def _release_task(self, task_id: int) -> None:
+        self._retired_tasks.pop(task_id, None)
+        self._task_diagnostic(f"task {task_id} Qt objects released")
 
     @Slot(object)
     def _task_succeeded(self, value: object) -> None:
         if self._callback is not None and not self._closing:
             try:
                 self._callback(value)
-            except Exception:
+            except Exception as error:
                 self._show_error("Could not display the result. Please retry.")
+                if os.environ.get("SOLAR_RPG_DEVELOPMENT") == "1":
+                    print(f"Desktop result callback failed: {type(error).__name__}", flush=True)
+                    print("".join(traceback.format_tb(error.__traceback__)), flush=True)
 
     @Slot()
     def _task_finished(self) -> None:
+        task_id = self._active_task_id
+        thread = self._thread
+        if os.environ.get("SOLAR_RPG_DEVELOPMENT") == "1":
+            from shiboken6 import isValid
+            running = thread.isRunning() if thread is not None and isValid(thread) else "unavailable"
+            self._task_diagnostic(f"task {task_id} finished; running={running}; "
+                                  f"GUI thread={QThread.currentThread() == self.thread()}")
+        self._active_task_id = None
         self._thread = None
         self._worker = None
         self._cancel = None
@@ -215,8 +264,16 @@ class MainWindow(QMainWindow):
         self._set_busy(False)
         if self._pending_narration is not None and not self._closing:
             text, world_name = self._pending_narration
+            cues = self._pending_audio_cues
             self._pending_narration = None
-            self._start_narration(text, world_name)
+            self._pending_audio_cues = None
+            try:
+                self._start_narration(text, world_name, cues)
+            except Exception as error:
+                self._show_error("Audio could not start; the committed turn remains available as text.")
+                if os.environ.get("SOLAR_RPG_DEVELOPMENT") == "1":
+                    print(f"Desktop audio callback failed: {type(error).__name__}", flush=True)
+                    print("".join(traceback.format_tb(error.__traceback__)), flush=True)
         if self._closing:
             QTimer.singleShot(0, self.close)
 
@@ -232,6 +289,7 @@ class MainWindow(QMainWindow):
             self.cancel_operation()
             event.ignore()
         else:
+            self.audio_playback.stop()
             event.accept()
 
     def show_menu(self) -> None:
@@ -362,20 +420,45 @@ class MainWindow(QMainWindow):
         print(f"Promoted completed campaign: {target.name}", flush=True)
         return WorldRef(world.name, str(target), world.seed)
 
-    def _start_narration(self, text: str, world_name: str) -> None:
+    def _start_narration(self, text: str, world_name: str, cues: dict | None = None) -> None:
         if not self.audio_service.api_key():
-            self._show_message(f"Campaign ready: {world_name} (ElevenLabs key missing; text-only mode).")
+            self._show_message(f"{world_name}: narration unavailable; continuing in text-only mode.")
             return
         def task(cancel: Event, progress: Callable[[str], None]):
             if cancel.is_set():
                 print("ElevenLabs narration: worker cancelled before request.", flush=True)
-                return None
+                return []
+            paths = []
             try:
-                return self.audio_service.speak_narration(text)
+                paths.append(self.audio_service.speak_narration(text))
             except AudioError:
-                return None
+                return []
+            world_cues = {
+                "harbor": "Harbor gulls and gentle waves",
+                "quest_complete": "A short triumphant chime",
+                "danger": "Distant warning bells",
+            }
+            descriptions = list((cues or {}).get("sfx", []))
+            descriptions.extend(world_cues[item["cue"]] for item in (cues or {}).get("world_cues", [])
+                                if isinstance(item, dict) and item.get("kind") == "sfx"
+                                and item.get("cue") in world_cues)
+            ambience = (cues or {}).get("ambience")
+            if isinstance(ambience, str):
+                descriptions.append(ambience)
+            descriptions.extend(world_cues[item["cue"]] for item in (cues or {}).get("world_cues", [])
+                                if isinstance(item, dict) and item.get("kind") == "ambience"
+                                and item.get("cue") in world_cues)
+            for description in descriptions[:4]:
+                if cancel.is_set():
+                    break
+                try:
+                    paths.append(self.audio_service.play_sound_effect(description))
+                except AudioError:
+                    continue
+            return paths
         self._run_task("Generating narration audio...", task,
-                       lambda path: path and self.audio_playback.play(path, self.preferences.audio_volume()))
+                       lambda paths: paths and self.audio_playback.play_sequence(
+                           paths, self.preferences.audio_volume()))
 
     def create_character(self) -> None:
         if self.intro is None or self._thread is not None:
@@ -383,15 +466,53 @@ class MainWindow(QMainWindow):
         description = self.creation.description.toPlainText()
         intro = self.intro
         self._run_task("Creating character...",
-                       lambda cancel, progress: self._active_game_service.create_character(intro, description, cancel),
-                       self._show_session)
+                       lambda cancel, progress: (
+                           self._active_game_service.create_character(intro, description, cancel, progress)
+                           if isinstance(self._active_game_service, PhaseTwoCampaignService)
+                           else self._active_game_service.create_character(intro, description, cancel)),
+                       self._show_created_character)
+
+    def _show_created_character(self, value: object) -> None:
+        if isinstance(value, CharacterRevision):
+            self.creation.show_revision(value.questions)
+            self._show_message("Gemini needs a little more detail about your character.")
+            return
+        self._show_session(value)
+        if isinstance(value, GameSession):
+            self._queue_session_narration(value)
 
     def _show_session(self, value: object) -> None:
         assert isinstance(value, GameSession)
         self.session = value
-        self.game.show_session(value)
+        self.game.show_session(value, is_offline_demo=self._active_game_service is self.demo_game_service)
         self.stack.setCurrentWidget(self.game)
-        self._show_message(f"Now exploring {value.world.name}.")
+        if self._active_game_service is self.demo_game_service:
+            self._show_message(f"Offline simulated gameplay: {value.world.name}")
+        else:
+            self._show_message(f"Now exploring {value.world.name} with Gemini.")
+
+    def _queue_session_narration(self, session: GameSession) -> None:
+        if session.last_narration and self.preferences.audio_enabled():
+            self._pending_narration = (session.last_narration, session.world.name)
+            self._pending_audio_cues = session.audio_cues
+
+    def _show_action_session(self, value: object) -> None:
+        self._show_session(value)
+        if isinstance(value, GameSession):
+            self._queue_session_narration(value)
+
+    def prepare_travel(self, item) -> None:
+        if self._thread is not None:
+            return
+        self.game.action.setPlainText(f"I seek a safe way to travel to {item.text()}.")
+        self.game.action.setFocus()
+
+    def prepare_conversation(self, item) -> None:
+        if self._thread is not None:
+            return
+        name = item.text().split(" — ", 1)[0]
+        self.game.action.setPlainText(f"I speak with {name}.")
+        self.game.action.setFocus()
 
     def take_action(self) -> None:
         if self.session is None or self._thread is not None:
@@ -402,7 +523,7 @@ class MainWindow(QMainWindow):
                            self._active_game_service.perform_action(session, action, cancel, progress)
                            if isinstance(self._active_game_service, PhaseTwoCampaignService)
                            else self._active_game_service.perform_action(session, action, cancel)),
-                       self._show_session)
+                       self._show_action_session)
 
     def save_game(self) -> None:
         if self.session is None or self._thread is not None:
@@ -423,7 +544,12 @@ class MainWindow(QMainWindow):
 
     def load_game_from_path(self, path: Path) -> None:
         self._run_task("Loading game...",
-                       lambda cancel, progress: self.save_store.load(path), self._show_session)
+                       lambda cancel, progress: self.save_store.load(path), self._show_loaded_session)
+
+    def _show_loaded_session(self, value: object) -> None:
+        assert isinstance(value, GameSession)
+        self._active_game_service = self.game_service if value.world.directory else self.demo_game_service
+        self._show_session(value)
 
     def open_settings(self) -> None:
         if self._thread is not None:

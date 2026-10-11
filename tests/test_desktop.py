@@ -69,6 +69,18 @@ class DesktopTests(unittest.TestCase):
                 process.terminate()
                 process.communicate(timeout=5)
 
+    def test_twenty_audio_turns_survive_in_subprocess(self):
+        environment = os.environ.copy()
+        environment["QT_QPA_PLATFORM"] = "offscreen"
+        environment.pop("GEMINI_API_KEY", None)
+        environment.pop("ELEVENLABS_API_KEY", None)
+        process = subprocess.run(
+            [sys.executable, str(Path(__file__).with_name("qt_turn_stress.py"))],
+            cwd=Path(__file__).resolve().parents[1], env=environment,
+            capture_output=True, text=True, timeout=45)
+        self.assertEqual(process.returncode, 0, process.stdout[-1500:] + process.stderr[-1500:])
+        self.assertIn("20 mocked gameplay turns", process.stdout)
+
     @classmethod
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
@@ -152,6 +164,29 @@ class DesktopTests(unittest.TestCase):
         window.game.menu_button.click()
         self.assertIs(window.stack.currentWidget(), window.menu)
 
+    def test_offline_demo_gameplay_is_clearly_labeled(self):
+        window = self.window
+        window.menu.demo_button.click()
+        self.wait_until(lambda: window.stack.currentWidget() is window.creation)
+        self.wait_idle()
+        self.assertIn("Offline mock campaign", window.creation.mode_note.text())
+        window.creation.description.setPlainText("An archivist")
+        window.creation.create_button.click()
+        self.wait_until(lambda: window.stack.currentWidget() is window.game)
+        self.wait_idle()
+        self.assertIn("SIMULATED OFFLINE GAMEPLAY", window.game.mode_note.text())
+        self.assertIn("Offline simulated gameplay", window.message.text())
+
+    def test_gameplay_can_shrink_while_take_action_remains_visible(self):
+        window = self.window
+        self.begin_game()
+        window.resize(850, 420)
+        self.app.processEvents()
+        self.assertLessEqual(window.height(), 420)
+        bottom = window.game.send_button.mapTo(
+            window, window.game.send_button.rect().bottomRight()).y()
+        self.assertLessEqual(bottom, window.height())
+
     def test_duplicate_generation_and_cancel(self):
         window = self.window
         window.menu.new_button.click()
@@ -209,6 +244,9 @@ class DesktopTests(unittest.TestCase):
         self.assertFalse(self.keyring.values)
         self.assertEqual(s.gemini_key.text(), "")
         self.assertIn("cleared", window.message.text())
+        # This security/save test must never contact ElevenLabs even though it
+        # verifies that a typed session key cannot leak into the save file.
+        window.audio_service.api_key = lambda: ""
         self.begin_game()
         window.game.save_button.click()
         self.wait_until(lambda: any(self.prefs.save_root().glob("*.json")))

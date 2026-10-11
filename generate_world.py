@@ -21,6 +21,11 @@ if __name__ == "__main__":
               "Then run: python generate_world.py", file=sys.stderr)
         raise SystemExit(1)
 
+from runtime_paths import configure_playwright_browser, default_cli_export_root, playwright_browser_error
+
+# Must be set before Playwright is imported, including in the spawned worker.
+configure_playwright_browser()
+
 from playwright.sync_api import sync_playwright
 from shapely.errors import GEOSException
 
@@ -33,7 +38,7 @@ from safe_storage import (DEFAULT_MAX_BYTES, checked_path, check_limit, generati
 from world_parser import parse_world, process_world, validate_minimal
 
 URL = "https://azgaar.github.io/Fantasy-Map-Generator/"
-EXPORTS = Path(__file__).resolve().parent / "exports"
+EXPORTS = default_cli_export_root()
 MINIMAL_BUTTON = "#exportMapData button[onclick=\"exportToJson('Minimal')\"]"
 GENERATION_LISTENER = """
 window.__azgaarGenerated = null;
@@ -94,6 +99,9 @@ def generate_world(headless=True, timeout_seconds=180, coastline_tolerance=3.0,
     Call from a background UI thread with a threading.Event for cancellation.
     The host application's entry point needs the usual __main__ guard on Windows.
     """
+    browser_error = playwright_browser_error()
+    if browser_error:
+        raise GenerationError(browser_error)
     deadlines = {
         "timeout_seconds": timeout_seconds, "total_timeout_seconds": total_timeout_seconds,
         "navigation_timeout_seconds": navigation_timeout_seconds if navigation_timeout_seconds is not None else timeout_seconds,

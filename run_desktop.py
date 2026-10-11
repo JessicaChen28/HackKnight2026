@@ -4,6 +4,7 @@ import importlib.util
 import multiprocessing
 import sys
 import faulthandler
+import logging
 
 
 def main() -> int:
@@ -16,11 +17,17 @@ def main() -> int:
         return 1
 
     from PySide6.QtWidgets import QApplication
+    from desktop.storage import Preferences
     from desktop.window import MainWindow
+    from runtime_paths import configure_file_logging
 
     app = QApplication(sys.argv)
     app.setOrganizationName("SOLARRPG")
     app.setApplicationName("SOLARRPG")
+    preferences = Preferences()
+    log_path = configure_file_logging(preferences.base)
+    if log_path:
+        logging.getLogger("solar_rpg").info("SOLAR RPG started (frozen=%s)", bool(getattr(sys, "frozen", False)))
     app.setStyleSheet("""
         QWidget { background: #171a20; color: #e9e2d3; font-family: 'Segoe UI'; font-size: 11pt; }
         QMainWindow, QStackedWidget { background: #171a20; }
@@ -42,7 +49,7 @@ def main() -> int:
         QSlider::groove:horizontal { height: 5px; background: #45505a; }
         QSlider::handle:horizontal { background: #d7b36e; width: 15px; margin: -5px 0; }
     """)
-    window = MainWindow()
+    window = MainWindow(preferences=preferences)
     window.show()
     return app.exec()
 

@@ -1,65 +1,47 @@
-# Phase 3B/3C world operation contract
+# Phase 3A/3B/3C integration contract
 
-The shared Python API is [`world_operations.py`](world_operations.py). A Gemini
-turn response may propose `operations`, but Phase 3B parses each proposal into
-one of four immutable classes. It rejects unknown fields and arbitrary patches.
-
-| JSON `type` | Required fields | Optional fields |
-| --- | --- | --- |
-| `travel_request` | either `destination_burg_id` or `direction` plus `distance` | none |
-| `npc_interaction` | `npc_id`, `intent` | none |
-| `quest_update` | `quest_id`, `event` | none |
-| `world_event` | `description` | none |
-
-`direction` is one of north, northeast, east, southeast, south, southwest,
-west, northwest. `distance` is a positive map distance at most 1000. A
-destination uses an Azgaar burg ID. Phase 3C must validate the destination,
-travel rules, NPC/quest references, and consequences against its own world
-model; Phase 3B does not interpret these requests as completed actions.
-
-Register a handler with `WorldDispatcher.register(kind, handler)`. Its signature
-is `handler(operation, world, gamestate, notes) -> OperationOutcome`. The three
-dicts are detached copies of the authoritative files. Handler code may edit
-them and must return a short, player-safe summary plus optional structured
-events. Any handler failure aborts the whole turn before persistence. A turn
-with an operation whose handler is absent is rejected. Register handlers before
-calling `process_turn`; the desktop can continue using text-only turns until
-Phase 3C supplies them.
-
-Phase 3B commits validated turn data only after every handler succeeds. Phase
-3C should not write files or call Gemini/ElevenLabs inside a handler. These
-constraints let Phase 3B validate every proposed effect before it invokes the
-existing rollback helper.
-
-## Turn engine API
+The desktop calls `character_creation.create_character(description, directory,
+api_key=..., progress=..., cancel_event=...)` after Phase 2 has initialized a
+world. An accepted result persists the character in `gamestate.json` and sets
+`phase` to `playing`. A revision result returns questions without changing
+the campaign. Both requests run in a Qt worker.
 
 `gameplay_turn.process_turn(directory, player_action, *, client=None,
 dispatcher=None, expected_turn=None, max_proposals=2, cancel_event=None,
-progress=None) -> TurnResult` loads the three authoritative JSON files and
-requires `gamestate.phase == "playing"` with a nonempty `player` object. Pass
-`expected_turn` from the current UI session to reject a stale submission.
-The engine locks the campaign directory while the request and commit run, so
-a second submission is rejected. The caller may inject a fake Gemini client
-with `generate(system_prompt, turns) -> str` for offline tests.
+progress=None) -> TurnResult` takes a natural-language attempt and reads
+`world.json`, `gamestate.json`, `notes.json`, and any `coastlines.json`.
+It requires an accepted character and `phase == "playing"`. The desktop passes
+the UI's `expected_turn`; a per-campaign lock rejects simultaneous turns.
 
-The structured Gemini response is an object with required `narration` text and
-optional `dialogue`, `player_changes`, `operations`, `dm_note`, `audio_cues` and
-`status`. Dialogue entries use existing `speaker_id` values. Player changes
-allow bounded `health_delta` only when the character has numeric health, plus
-inventory and condition additions/removals against existing lists. Audio cues
-contain up to three sound-effect descriptions and one ambience description;
-Phase 3B returns them without making audio requests. `status` is `continue`
-or `campaign_complete`. Phase 3C operations use the schema above.
+Gemini proposes a JSON object with required `narration` and optional
+`dialogue`, `player_changes`, `operations`, `dm_note`, `audio_cues`, and
+`status`. Dialogue uses existing NPC keys as `speaker_id`. Player changes
+support bounded health changes when health exists, additions/removals from the
+character's existing inventory format, existing condition lists, and a status
+condition when the character has a status object. Arbitrary JSON paths and
+unsupported fields are rejected. Audio cues are at most three SFX descriptions
+and one ambience description.
 
-`TurnResult` contains the committed turn number, narration, dialogue, world
-events, audio cues, status, a player snapshot, location and active quest names.
-The engine uses Phase 2's `save_all` rollback helper for files changed by the
-turn. This is a staged multi-file write with rollback on caught failures, not
-an atomic filesystem transaction across multiple JSON files. A process crash
-between file replacements still needs recovery work in a future phase.
+The default world-operation service is Phase 3C's
+`world_interactions.apply_world_operations(world, notes, gamestate, operations,
+coastlines=...)`. Its full JSON schema and travel constraints are in
+[WORLD_INTERACTIONS.md](WORLD_INTERACTIONS.md). Phase 3B assigns each proposed
+operation a stable `turn_<number>_op_<ordinal>` ID, passes detached candidate
+dictionaries to Phase 3C, and uses its validated results and replay receipts.
+World-operation errors reject the proposal before persistence. The earlier
+`world_operations.WorldDispatcher` remains available as an optional test and
+adapter interface; desktop gameplay uses Phase 3C directly.
 
-Phase 3A has not landed in this checkout. Its accepted-character step should
-set `gamestate.phase` to `playing`, populate `gamestate.player`, and keep
-`campaign.current_turn` at zero. The desktop adapter uses this engine once
-those conditions are true; earlier mock character creation continues to use
-its mock gameplay path.
+`TurnResult` contains the committed turn number, narration, NPC dialogue,
+validated world events, audio cues (including Phase 3C suggestions), status,
+player snapshot, location, and active quests. The desktop rebuilds its display
+from the authoritative files after each turn. It sends narration and audio cues
+to ElevenLabs only after the turn has committed. Audio failures do not roll back
+gameplay.
+
+Phase 2's `save_all` writes staged files and rolls back on caught failures;
+it is not a crash-atomic transaction across multiple JSON files. The game save
+button writes a small version-2 pointer to the world directory, retaining the
+introduction and character opening. Loading it always rereads the authoritative
+campaign files, so an older save pointer resumes the latest committed turn.
+The offline demo keeps its version-1 narrative save format.
