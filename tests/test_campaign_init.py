@@ -184,6 +184,55 @@ class InitializerTests(unittest.TestCase):
         finally:
             original_client.close()
 
+    def test_http_400_reports_sanitized_reason_without_retry(self):
+        from google.genai import errors
+
+        key = "test-only-secret-key"
+        private = "WORLD BRIEF: private campaign data"
+        provider_message = ("Invalid response mime type application/json; key=" + key
+                            + "; " + private)
+        client = ci.GeminiClient(api_key=key, max_request_attempts=2)
+        original_client = client._client
+        calls, progress = [], []
+
+        def reject_request(**kwargs):
+            calls.append(1)
+            raise errors.ClientError(400, {"error": {"message": provider_message,
+                                                      "status": "INVALID_ARGUMENT"}})
+
+        client._progress = progress.append
+        client._client = SimpleNamespace(models=SimpleNamespace(generate_content=reject_request))
+        try:
+            with patch("campaign_init.time.sleep") as sleep:
+                with self.assertRaises(ci.CampaignInitError) as caught:
+                    client.generate("system", [("user", "prompt")])
+            self.assertEqual(len(calls), 1)
+            sleep.assert_not_called()
+            reported = str(caught.exception) + " ".join(progress)
+            self.assertIn("Invalid response mime type", reported)
+            self.assertNotIn(key, reported)
+            self.assertNotIn("private campaign data", reported)
+        finally:
+            original_client.close()
+
+    def test_gemini_3_omits_deprecated_temperature_but_requests_json(self):
+        client = ci.GeminiClient(api_key="test-only-key", model="gemini-3.8-flash")
+        original_client = client._client
+        captured = []
+
+        def accept_request(**kwargs):
+            captured.append(kwargs)
+            return SimpleNamespace(text='{"status":"ok"}')
+
+        client._client = SimpleNamespace(models=SimpleNamespace(generate_content=accept_request))
+        try:
+            self.assertEqual(client.generate("system", [("user", "prompt")]), '{"status":"ok"}')
+            self.assertEqual(len(captured), 1)
+            self.assertEqual(captured[0]["config"].response_mime_type, "application/json")
+            self.assertIsNone(captured[0]["config"].temperature)
+        finally:
+            original_client.close()
+
     def test_real_azgaar_world_completes_local_campaign_stages(self):
         fixture_path = Path(__file__).parent / "fixtures" / "frepoyland.json.gz"
         with gzip.open(fixture_path, "rt", encoding="utf-8") as stream:

@@ -205,6 +205,27 @@ def _check_cancelled(cancel_event):
         raise CampaignInitError("Campaign initialization cancelled.")
 
 
+def _safe_api_message(error, api_key: str) -> str:
+    """Keep the provider's reason while removing credentials and request data."""
+    message = getattr(error, "message", None)
+    if not isinstance(message, str) or not message.strip():
+        return "No error detail supplied by Gemini."
+    # API errors normally contain a short reason. Never include subsequent
+    # lines, which can contain request fields or values echoed by a server.
+    message = message.splitlines()[0]
+    for marker in ("WORLD BRIEF", "GAMESTATE", "NOTES:", "Authorization", "x-goog-api-key", "contents:"):
+        index = message.lower().find(marker.lower())
+        if index >= 0:
+            message = message[:index] + "[request detail removed]"
+    message = re.sub(r"(?i)Bearer\s+\S+", "Bearer [credential removed]", message)
+    message = re.sub(r"(?i)(?:api[_-]?key|key)=\S+", "key=[credential removed]", message)
+    message = re.sub(r"AIza[A-Za-z0-9_-]{12,}", "[credential removed]", message)
+    if api_key:
+        message = message.replace(api_key, "[credential removed]")
+    message = re.sub(r"[\x00-\x1f\x7f]", " ", message).strip()
+    return message[:240] or "Request detail removed."
+
+
 class GeminiClient:
     """Thin wrapper over google-genai. Tests can substitute any object with .generate()."""
 
@@ -227,6 +248,7 @@ class GeminiClient:
         self._max_request_attempts = max_request_attempts
         self._progress = progress
         self._cancel_event = cancel_event
+        self._api_key = key
         # The SDK can retry on its own. Disable those retries so the limits
         # below are observable and bounded at the application layer.
         self._client = genai.Client(
@@ -237,8 +259,12 @@ class GeminiClient:
     def generate(self, system_prompt: str, turns) -> str:
         types = self._types
         contents = [types.Content(role=role, parts=[types.Part.from_text(text=text)]) for role, text in turns]
-        config = types.GenerateContentConfig(system_instruction=system_prompt, temperature=self.temperature,
-                                             response_mime_type="application/json")
+        config_fields = {"system_instruction": system_prompt, "response_mime_type": "application/json"}
+        # Gemini 3 no longer accepts custom sampling parameters. Keep the
+        # configurable temperature for older model overrides only.
+        if not self.model.startswith("gemini-3"):
+            config_fields["temperature"] = self.temperature
+        config = types.GenerateContentConfig(**config_fields)
         for attempt in range(1, self._max_request_attempts + 1):
             _check_cancelled(self._cancel_event)
             started = time.perf_counter()
@@ -251,9 +277,12 @@ class GeminiClient:
                 return response.text
             except self._errors.APIError as error:
                 transient = getattr(error, "code", None) in (429, 500, 502, 503, 504)
-                _diagnostic(self._progress, f"Gemini API request {attempt} failed after {time.perf_counter() - started:.3f}s (HTTP {getattr(error, 'code', 'unknown')}).")
+                code = getattr(error, "code", None)
+                status = code if type(code) is int else "unknown"
+                reason = _safe_api_message(error, self._api_key)
+                _diagnostic(self._progress, f"Gemini API request {attempt} failed after {time.perf_counter() - started:.3f}s (HTTP {status}): {reason}")
                 if not transient or attempt == self._max_request_attempts:
-                    raise CampaignInitError("Gemini API request failed. Check the key, model, and connection.") from error
+                    raise CampaignInitError(f"Gemini API request failed (HTTP {status}): {reason}") from error
             except CampaignInitError:
                 _diagnostic(self._progress, f"Gemini API request {attempt} returned no usable text after {time.perf_counter() - started:.3f}s.")
                 raise
