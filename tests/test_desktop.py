@@ -177,6 +177,16 @@ class DesktopTests(unittest.TestCase):
         self.assertIn("SIMULATED OFFLINE GAMEPLAY", window.game.mode_note.text())
         self.assertIn("Offline simulated gameplay", window.message.text())
 
+    def test_gameplay_can_shrink_while_take_action_remains_visible(self):
+        window = self.window
+        self.begin_game()
+        window.resize(850, 420)
+        self.app.processEvents()
+        self.assertLessEqual(window.height(), 420)
+        bottom = window.game.send_button.mapTo(
+            window, window.game.send_button.rect().bottomRight()).y()
+        self.assertLessEqual(bottom, window.height())
+
     def test_duplicate_generation_and_cancel(self):
         window = self.window
         window.menu.new_button.click()

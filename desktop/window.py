@@ -9,7 +9,7 @@ from uuid import uuid4
 from threading import Event
 from typing import Callable
 
-from PySide6.QtCore import QObject, QThread, QTimer, Qt, Signal, Slot
+from PySide6.QtCore import QObject, QSize, QThread, QTimer, Qt, Signal, Slot
 from PySide6.QtWidgets import (QFileDialog, QHBoxLayout, QLabel, QMainWindow,
                                QProgressBar, QPushButton, QStackedWidget, QVBoxLayout, QWidget)
 
@@ -26,6 +26,13 @@ Task = Callable[[Event, Callable[[str], None]], object]
 
 class CampaignPromotionError(GameError):
     """A completed campaign could not be published, but remains recoverable."""
+
+
+class ResponsiveStack(QStackedWidget):
+    """Allow the window to shrink to the active screen instead of its tallest page."""
+
+    def minimumSizeHint(self) -> QSize:
+        return QSize(0, 0)
 
 
 class TaskWorker(QObject):
@@ -105,7 +112,7 @@ class MainWindow(QMainWindow):
         root = QWidget()
         outer = QVBoxLayout(root)
         outer.setContentsMargins(0, 0, 0, 0)
-        self.stack = QStackedWidget()
+        self.stack = ResponsiveStack()
         outer.addWidget(self.stack, 1)
         self.menu = MainMenuScreen()
         self.creation = CharacterCreationScreen()
