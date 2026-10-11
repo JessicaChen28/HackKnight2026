@@ -38,9 +38,16 @@ try {
     if (-not $ConsoleDebug -and -not $SkipInstaller) {
         $Iscc = Get-Command iscc -ErrorAction SilentlyContinue
         if (-not $Iscc) {
-            $Candidate = Join-Path $env:LOCALAPPDATA "Programs\Inno Setup 6\ISCC.exe"
-            if (Test-Path -LiteralPath $Candidate) {
-                $Iscc = Get-Item -LiteralPath $Candidate
+            $Candidates = @(
+                (Join-Path $env:LOCALAPPDATA "Programs\Inno Setup 6\ISCC.exe"),
+                (Join-Path ${env:ProgramFiles(x86)} "Inno Setup 6\ISCC.exe"),
+                (Join-Path $env:ProgramFiles "Inno Setup 6\ISCC.exe")
+            )
+            foreach ($Candidate in $Candidates) {
+                if ($Candidate -and (Test-Path -LiteralPath $Candidate)) {
+                    $Iscc = Get-Item -LiteralPath $Candidate
+                    break
+                }
             }
         }
         if (-not $Iscc) {
