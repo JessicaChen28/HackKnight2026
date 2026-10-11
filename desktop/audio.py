@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 from pathlib import Path
 from typing import Callable
 
@@ -17,6 +18,39 @@ DEFAULT_MODEL = "eleven_multilingual_v2"
 
 class AudioError(RuntimeError):
     pass
+
+
+def _safe_elevenlabs_error(error, api_key: str = "") -> str:
+    """Return a short diagnostic without credentials or response payloads."""
+    status = getattr(error, "status_code", None) or getattr(error, "status", None)
+    body = getattr(error, "body", None)
+    api_code = api_detail = ""
+    if isinstance(body, dict):
+        api_code = str(body.get("code") or body.get("error_code") or "")
+        api_detail = str(body.get("detail") or body.get("message") or "")
+        if isinstance(body.get("detail"), dict):
+            detail = body["detail"]
+            api_code = str(detail.get("status") or detail.get("code") or api_code)
+            api_detail = str(detail.get("message") or detail.get("detail") or "")
+    message = str(getattr(error, "message", "") or api_detail or "No provider message")
+    message = message.splitlines()[0]
+    if api_key:
+        message = message.replace(api_key, "[credential removed]")
+    message = re.sub(r"(?i)Bearer\s+\S+", "Bearer [credential removed]", message)
+    message = re.sub(r"(?i)(?:api[_-]?key|authorization|key)=\S+", "[credential removed]", message)
+    message = re.sub(r"AIza[A-Za-z0-9_-]{12,}", "[credential removed]", message)
+    message = re.sub(r"[\x00-\x1f\x7f]", " ", message).strip()[:240]
+    lower = f"{status} {api_code} {message}".lower()
+    if status in (401, 403) or any(word in lower for word in ("unauthorized", "authentication", "invalid api key", "permission")):
+        category = "authentication/permissions"
+    elif status == 429 or any(word in lower for word in ("quota", "rate limit", "too many")):
+        category = "quota/rate limit"
+    elif status == 400 or any(word in lower for word in ("invalid", "parameter", "voice", "model")):
+        category = "invalid parameters"
+    else:
+        category = "unknown/provider failure"
+    return (f"status={status or 'unknown'} category={category} "
+            f"api_code={api_code or 'unknown'} detail={message or 'none'}")
 
 
 class ElevenLabsAudioService:
@@ -85,7 +119,9 @@ class ElevenLabsAudioService:
             print(f"ElevenLabs narration: TTS response saved ({result.name}, mp3).", flush=True)
             return result
         except Exception as error:
-            print(f"ElevenLabs narration: TTS failed ({type(error).__name__}).", flush=True)
+            diagnostic = _safe_elevenlabs_error(error, self.api_key())
+            print(f"ElevenLabs narration: TTS failed type={type(error).__name__}; "
+                  f"voice={voice_id or self.voice_id}; model={self.model}; {diagnostic}", flush=True)
             raise AudioError("ElevenLabs narration generation failed.") from error
 
     def play_sound_effect(self, description: str) -> Path:
@@ -98,6 +134,8 @@ class ElevenLabsAudioService:
             stream = self._sdk_client().sound_generation.convert(text=description, output_format="mp3_44100_128")
             return self._write_stream(path, stream)
         except Exception as error:
+            diagnostic = _safe_elevenlabs_error(error, self.api_key())
+            print(f"ElevenLabs sound effect failed type={type(error).__name__}; {diagnostic}", flush=True)
             raise AudioError("ElevenLabs sound generation failed.") from error
 
     def set_ambience(self, description: str) -> Path:

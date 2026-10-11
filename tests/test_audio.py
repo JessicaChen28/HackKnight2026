@@ -4,7 +4,7 @@ from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
 
-from desktop.audio import AudioError, ElevenLabsAudioService
+from desktop.audio import AudioError, ElevenLabsAudioService, _safe_elevenlabs_error
 
 
 class FakeTTS:
@@ -22,6 +22,22 @@ class FakeClient:
 
 
 class AudioTests(unittest.TestCase):
+    def test_api_error_is_sanitized_and_classified(self):
+        class ApiErrorLike(Exception):
+            status_code = 401
+            body = {"detail": {"status": "invalid_api_key", "message": "bad key"}}
+        result = _safe_elevenlabs_error(ApiErrorLike(), "secret-key")
+        self.assertIn("status=401", result)
+        self.assertIn("authentication/permissions", result)
+        self.assertIn("invalid_api_key", result)
+        self.assertNotIn("secret-key", result)
+
+    def test_invalid_parameter_error_is_classified(self):
+        class ApiErrorLike(Exception):
+            status_code = 400
+            body = {"code": "voice_not_found", "detail": "voice is invalid"}
+        self.assertIn("invalid parameters", _safe_elevenlabs_error(ApiErrorLike()))
+
     def test_tts_cache_avoids_duplicate_requests(self):
         with TemporaryDirectory() as root:
             client = FakeClient()
