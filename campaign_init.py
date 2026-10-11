@@ -229,7 +229,7 @@ def _safe_api_message(error, api_key: str) -> str:
 class GeminiClient:
     """Thin wrapper over google-genai. Tests can substitute any object with .generate()."""
 
-    def __init__(self, api_key=None, model=None, temperature=0.9, timeout_seconds=45,
+    def __init__(self, api_key=None, model=None, temperature=0.9, timeout_seconds=120,
                  max_request_attempts=2, progress=None, cancel_event=None):
         key = api_key or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
         if not key:
