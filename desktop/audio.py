@@ -8,6 +8,8 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import traceback
+from uuid import uuid4
 from pathlib import Path
 from typing import Callable
 
@@ -15,6 +17,7 @@ from typing import Callable
 DEFAULT_VOICE = "Rachel"
 DEFAULT_VOICE_ID = "21m00Tcm4TlvDq8ikWAM"
 DEFAULT_MODEL = "eleven_multilingual_v2"
+SFX_MODEL = "eleven_text_to_sound_v2"
 
 
 class AudioError(RuntimeError):
@@ -62,13 +65,17 @@ class ElevenLabsAudioService:
         self.cache_dir = Path(cache_dir or (Path.home() / ".solar-rpg" / "audio-cache"))
         self.voice_id, self.model, self._client = voice_id, model, client
         self._resolved_voices: dict[str, str] = {}
+        self._failed_sfx: set[str] = set()
 
     def api_key(self) -> str:
         value = self._key() if callable(self._key) else self._key
         return (value or os.environ.get("ELEVENLABS_API_KEY", "")).strip()
 
     def _path(self, kind: str, text: str, voice: str | None = None) -> Path:
-        token = hashlib.sha256(f"{kind}\0{voice or self.voice_id}\0{self.model}\0{text}".encode()).hexdigest()
+        # Sound effects have their own model and do not vary with TTS voice.
+        model = SFX_MODEL if kind == "sfx" else self.model
+        identity = "" if kind == "sfx" else (self.voice_id if voice is None else voice)
+        token = hashlib.sha256(f"{kind}\0{identity}\0{model}\0{text}".encode()).hexdigest()
         return self.cache_dir / f"{kind}-{token}.mp3"
 
     def _sdk_client(self):
@@ -116,13 +123,20 @@ class ElevenLabsAudioService:
     @staticmethod
     def _write_stream(path: Path, stream) -> Path:
         path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("wb") as output:
-            if isinstance(stream, (bytes, bytearray)):
-                output.write(stream)
-            else:
-                for chunk in stream:
-                    if chunk:
-                        output.write(chunk)
+        pending = path.with_name(f".{path.name}.{uuid4().hex}.part")
+        try:
+            with pending.open("wb") as output:
+                if isinstance(stream, (bytes, bytearray)):
+                    output.write(stream)
+                else:
+                    for chunk in stream:
+                        if chunk:
+                            output.write(chunk)
+            if not pending.stat().st_size:
+                raise AudioError("The audio response was empty.")
+            os.replace(pending, path)
+        finally:
+            pending.unlink(missing_ok=True)
         return path
 
     def speak_narration(self, text: str, voice_id: str | None = None) -> Path:
@@ -159,13 +173,26 @@ class ElevenLabsAudioService:
             raise AudioError("Cannot generate an empty sound effect.")
         path = self._path("sfx", description, "")
         if path.exists() and path.stat().st_size:
+            print(f"ElevenLabs sound effect: cache hit ({path.name}, mp3).", flush=True)
             return path
+        if path.name in self._failed_sfx:
+            raise AudioError("This sound effect failed earlier this session; continuing without it.")
         try:
-            stream = self._sdk_client().sound_generation.convert(text=description, output_format="mp3_44100_128")
-            return self._write_stream(path, stream)
+            stream = self._sdk_client().text_to_sound_effects.convert(
+                text=description, model_id=SFX_MODEL, output_format="mp3_44100_128")
+            result = self._write_stream(path, stream)
+            print(f"ElevenLabs sound effect: response saved ({result.name}, mp3).", flush=True)
+            return result
         except Exception as error:
-            diagnostic = _safe_elevenlabs_error(error, self.api_key())
-            print(f"ElevenLabs sound effect failed type={type(error).__name__}; {diagnostic}", flush=True)
+            self._failed_sfx.add(path.name)
+            if any(getattr(error, name, None) is not None for name in ("status_code", "status", "body")):
+                diagnostic = _safe_elevenlabs_error(error, self.api_key())
+                print(f"ElevenLabs sound effect API failed type={type(error).__name__}; {diagnostic}", flush=True)
+            else:
+                print(f"ElevenLabs sound effect local failure type={type(error).__name__}.", flush=True)
+                if os.environ.get("SOLAR_RPG_DEVELOPMENT") == "1":
+                    # Stack frames only: exception strings may contain SDK request data.
+                    print("".join(traceback.format_tb(error.__traceback__)), flush=True)
             raise AudioError("ElevenLabs sound generation failed.") from error
 
     def set_ambience(self, description: str) -> Path:
@@ -197,19 +224,23 @@ class AudioPlayback:
             print(f"Qt Multimedia initialization failed ({type(error).__name__}).", flush=True)
 
     def _on_error(self, error) -> None:
+        if os.environ.get("SOLAR_RPG_DEVELOPMENT") == "1":
+            print("Qt Multimedia: error callback on GUI thread=", self._on_gui_thread(), flush=True)
         print(f"Qt Multimedia: playback failed ({error}).", flush=True)
         self._advance_playlist()
 
     def _on_media_status(self, status) -> None:
-        if self._player is None:
+        if not self._valid_player():
             return
         from PySide6.QtCore import QTimer
         from PySide6.QtMultimedia import QMediaPlayer
+        if os.environ.get("SOLAR_RPG_DEVELOPMENT") == "1":
+            print(f"Qt Multimedia: status={status}; GUI thread={self._on_gui_thread()}.", flush=True)
         if status == QMediaPlayer.MediaStatus.EndOfMedia:
             QTimer.singleShot(0, self._advance_playlist)
 
     def _advance_playlist(self) -> None:
-        if self._playlist:
+        if self._playlist and self._valid_player():
             path = self._playlist.pop(0)
             self.play(path, self._playlist_volume)
 
@@ -220,11 +251,11 @@ class AudioPlayback:
         self._advance_playlist()
 
     def play(self, path: Path, volume: int = 70, loop: bool = False) -> None:
-        if self._player is None:
+        if not self._valid_player():
             print("Qt Multimedia: unable to play audio because playback is unavailable.", flush=True)
             return
         from PySide6.QtCore import QThread, QUrl
-        if self._player.thread() is not QThread.currentThread():
+        if self._player.thread() != QThread.currentThread():
             print("Qt Multimedia: refusing playback from a non-GUI thread.", flush=True)
             return
         self._output.setVolume(max(0, min(100, volume)) / 100)
@@ -232,10 +263,23 @@ class AudioPlayback:
         self._source = QUrl.fromLocalFile(str(path))
         self._player.setSource(self._source)
         self._player.play()
-        print(f"Qt Multimedia: playback started ({path.name}, mp3).", flush=True)
+        print(f"Qt Multimedia: playback started ({path.name}, {path.suffix.lstrip('.').lower()}).", flush=True)
+
+    def _valid_player(self) -> bool:
+        if self._player is None or self._output is None:
+            return False
+        from shiboken6 import isValid
+        return isValid(self._player) and isValid(self._output)
+
+    def _on_gui_thread(self) -> bool:
+        from PySide6.QtCore import QThread
+        return self._valid_player() and self._player.thread() == QThread.currentThread()
 
     def stop(self) -> None:
         self._playlist.clear()
-        if self._player is not None:
+        if self._valid_player():
+            from PySide6.QtCore import QUrl
             self._player.stop()
+            self._player.setSource(QUrl())
+            self._source = None
             print("Qt Multimedia: playback stopped.", flush=True)

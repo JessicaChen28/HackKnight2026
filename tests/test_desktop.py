@@ -69,6 +69,18 @@ class DesktopTests(unittest.TestCase):
                 process.terminate()
                 process.communicate(timeout=5)
 
+    def test_twenty_audio_turns_survive_in_subprocess(self):
+        environment = os.environ.copy()
+        environment["QT_QPA_PLATFORM"] = "offscreen"
+        environment.pop("GEMINI_API_KEY", None)
+        environment.pop("ELEVENLABS_API_KEY", None)
+        process = subprocess.run(
+            [sys.executable, str(Path(__file__).with_name("qt_turn_stress.py"))],
+            cwd=Path(__file__).resolve().parents[1], env=environment,
+            capture_output=True, text=True, timeout=45)
+        self.assertEqual(process.returncode, 0, process.stdout[-1500:] + process.stderr[-1500:])
+        self.assertIn("20 mocked gameplay turns", process.stdout)
+
     @classmethod
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])

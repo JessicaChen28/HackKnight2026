@@ -184,6 +184,17 @@ class InitializerTests(unittest.TestCase):
         finally:
             original_client.close()
 
+    def test_default_gemini_model_and_timeout(self):
+        with patch.dict("os.environ", {"GEMINI_MODEL": ""}):
+            client = ci.GeminiClient(api_key="test-only-key")
+        try:
+            self.assertEqual(client.model, "gemini-3.5-flash-lite")
+            options = client._client._api_client._http_options
+            self.assertEqual(options.timeout, 120000)
+            self.assertEqual(options.retry_options.attempts, 1)
+        finally:
+            client.close()
+
     def test_http_400_reports_sanitized_reason_without_retry(self):
         from google.genai import errors
 
