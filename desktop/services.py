@@ -238,9 +238,8 @@ class PhaseTwoCampaignService:
     this adapter; the vault can use GEMINI_API_KEY if nothing was saved.
     """
 
-    def __init__(self, api_key: Callable[[], str], placeholder: GameService | None = None):
+    def __init__(self, api_key: Callable[[], str]):
         self._api_key = api_key
-        self._placeholder = placeholder or MockGameService()
 
     def has_key(self) -> bool:
         return bool(self._api_key().strip())
@@ -297,7 +296,7 @@ class PhaseTwoCampaignService:
     def create_character(self, intro: CampaignIntro, description: str, cancel: Event,
                          progress: Progress | None = None) -> GameSession | CharacterRevision:
         if not intro.world.directory:
-            return self._placeholder.create_character(intro, description, cancel)
+            raise GameError("The production campaign directory is missing; character creation was not attempted.")
         from character_creation import ACCEPTED, NEEDS_REVISION, create_character
 
         key = self._api_key().strip()
@@ -316,10 +315,10 @@ class PhaseTwoCampaignService:
 
     def perform_action(self, session: GameSession, action: str, cancel: Event,
                        progress: Progress | None = None) -> GameSession:
-        """Use Phase 3B for accepted characters; keep the demo placeholder."""
+        """Resolve an accepted campaign through Phase 3B without mock fallback."""
         directory = session.world.directory
         if not directory or not (Path(directory) / "gamestate.json").exists():
-            return self._placeholder.perform_action(session, action, cancel)
+            raise GameError("The production campaign files are missing; no turn was submitted or saved.")
         from safe_storage import read_json
         state = read_json(Path(directory) / "gamestate.json")
         if state.get("phase") != "playing":

@@ -164,6 +164,19 @@ class DesktopTests(unittest.TestCase):
         window.game.menu_button.click()
         self.assertIs(window.stack.currentWidget(), window.menu)
 
+    def test_offline_demo_gameplay_is_clearly_labeled(self):
+        window = self.window
+        window.menu.demo_button.click()
+        self.wait_until(lambda: window.stack.currentWidget() is window.creation)
+        self.wait_idle()
+        self.assertIn("Offline mock campaign", window.creation.mode_note.text())
+        window.creation.description.setPlainText("An archivist")
+        window.creation.create_button.click()
+        self.wait_until(lambda: window.stack.currentWidget() is window.game)
+        self.wait_idle()
+        self.assertIn("SIMULATED OFFLINE GAMEPLAY", window.game.mode_note.text())
+        self.assertIn("Offline simulated gameplay", window.message.text())
+
     def test_duplicate_generation_and_cancel(self):
         window = self.window
         window.menu.new_button.click()
@@ -221,6 +234,9 @@ class DesktopTests(unittest.TestCase):
         self.assertFalse(self.keyring.values)
         self.assertEqual(s.gemini_key.text(), "")
         self.assertIn("cleared", window.message.text())
+        # This security/save test must never contact ElevenLabs even though it
+        # verifies that a typed session key cannot leak into the save file.
+        window.audio_service.api_key = lambda: ""
         self.begin_game()
         window.game.save_button.click()
         self.wait_until(lambda: any(self.prefs.save_root().glob("*.json")))

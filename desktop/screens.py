@@ -128,8 +128,11 @@ class GameplayScreen(QWidget):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(24, 22, 24, 22)
         heading, detail = title("Adventure", "The road continues with your next choice.")
+        self.mode_note = QLabel("Live Gemini gameplay")
+        self.mode_note.setObjectName("mutedText")
         outer.addWidget(heading)
         outer.addWidget(detail)
+        outer.addWidget(self.mode_note)
         columns = QHBoxLayout()
         story_column = QVBoxLayout()
         story_column.addWidget(QLabel("Story so far"))
@@ -198,7 +201,11 @@ class GameplayScreen(QWidget):
         row.addWidget(self.save_button)
         outer.addLayout(row)
 
-    def show_session(self, session: GameSession) -> None:
+    def show_session(self, session: GameSession, *, is_offline_demo: bool = False) -> None:
+        self.mode_note.setText(
+            "SIMULATED OFFLINE GAMEPLAY · no Gemini requests are made"
+            if is_offline_demo else "Live Gemini gameplay"
+        )
         # QPlainTextEdit never interprets HTML or script from a future AI service.
         transcript = "\n\n".join(f"{entry['speaker']}: {entry['text']}" for entry in session.history)
         self.history.setPlainText(transcript)

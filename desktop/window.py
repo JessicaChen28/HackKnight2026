@@ -477,9 +477,12 @@ class MainWindow(QMainWindow):
     def _show_session(self, value: object) -> None:
         assert isinstance(value, GameSession)
         self.session = value
-        self.game.show_session(value)
+        self.game.show_session(value, is_offline_demo=self._active_game_service is self.demo_game_service)
         self.stack.setCurrentWidget(self.game)
-        self._show_message(f"Now exploring {value.world.name}.")
+        if self._active_game_service is self.demo_game_service:
+            self._show_message(f"Offline simulated gameplay: {value.world.name}")
+        else:
+            self._show_message(f"Now exploring {value.world.name} with Gemini.")
 
     def _queue_session_narration(self, session: GameSession) -> None:
         if session.last_narration and self.preferences.audio_enabled():

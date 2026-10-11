@@ -9,3 +9,6 @@ venv/
 *.part
 .staging-*/
 node_modules
+build/
+dist/
+.test-tmp/

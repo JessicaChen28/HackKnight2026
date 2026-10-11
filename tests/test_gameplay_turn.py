@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 import campaign_init as campaign
 from gameplay_turn import TurnError, _turn_lock, process_turn
-from desktop.services import GameSession, PhaseTwoCampaignService, WorldRef
+from desktop.services import CampaignIntro, GameError, GameSession, PhaseTwoCampaignService, WorldRef
 from tests.test_campaign_init import make_world
 from world_operations import NpcInteraction, OperationOutcome, WorldDispatcher, parse_operation
 
@@ -224,6 +224,18 @@ class GameplayTurnTests(unittest.TestCase):
         self.assertIn("Innkeeper's note", updated.inventory)
         self.assertEqual(self.loaded()[1]["campaign"]["current_turn"], 1)
         self.assertEqual(session.turn, 0)
+
+    def test_production_adapter_never_falls_back_to_mock_gameplay(self):
+        service = PhaseTwoCampaignService(lambda: "test-only-key")
+        missing_world = WorldRef("Missing")
+        with self.assertRaisesRegex(GameError, "production campaign directory is missing"):
+            service.create_character(
+                CampaignIntro(missing_world, "Opening"), "A traveler", Event())
+        session = GameSession(missing_world, "Opening", "A traveler", "Arin", "Unknown")
+        with self.assertRaisesRegex(GameError, "production campaign files are missing"):
+            service.perform_action(session, "Walk onward", Event())
+        self.assertEqual(session.turn, 0)
+        self.assertEqual(session.history, [])
 
 
 if __name__ == "__main__":
