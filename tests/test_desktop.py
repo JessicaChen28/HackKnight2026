@@ -15,7 +15,7 @@ from unittest.mock import patch
 from PySide6.QtCore import QSettings, Qt
 from PySide6.QtWidgets import QApplication
 
-from desktop.services import (AzgaarWorldProvider, GameError, GameSession, MockGameService,
+from desktop.services import (AzgaarWorldProvider, CampaignIntro, GameError, GameSession, MockGameService,
                               PhaseTwoCampaignService, WorldRef)
 from desktop.storage import ApiKeyVault, Preferences, SERVICE_NAME
 from desktop.window import MainWindow
@@ -344,6 +344,27 @@ class DesktopTests(unittest.TestCase):
         service = PhaseTwoCampaignService(lambda: "")
         with self.assertRaisesRegex(GameError, "Save a Gemini API key"):
             service.initialize_campaign(WorldRef("Bright Vale", str(self.root)), Event())
+
+    def test_workspace_promotion_and_safe_cleanup(self):
+        pending = self.root / ".solar-pending-test"
+        generated = pending / "World_unique"
+        generated.mkdir(parents=True)
+        (generated / "world.json").write_text("{}", encoding="utf-8")
+        promoted = MainWindow._promote_workspace_world(
+            WorldRef("World", str(generated)), pending, self.root)
+        self.assertEqual(Path(promoted.directory), self.root / "World_unique")
+        self.assertTrue(Path(promoted.directory).exists())
+        self.assertFalse(pending.exists())
+
+        unrelated = self.root / "do-not-delete"
+        unrelated.mkdir()
+        MainWindow._cleanup_workspace(unrelated, self.root)
+        self.assertTrue(unrelated.exists())
+
+    def test_audio_narration_is_queued_only_when_enabled(self):
+        self.window.preferences.update(str(self.root / "exports"), str(self.root / "saves"), True, 70)
+        self.window._show_intro(CampaignIntro(WorldRef("Test"), "An opening."))
+        self.assertEqual(self.window._pending_narration, ("An opening.", "Test"))
 
     def test_reject_malformed_save_without_credential_fields(self):
         candidate = self.root / "invalid.json"

@@ -225,7 +225,7 @@ class SettingsScreen(QWidget):
         eleven_row.addWidget(self.clear_elevenlabs_button)
         form.addRow("ElevenLabs key", eleven_row)
         form.addRow("", self.remember_elevenlabs)
-        self.audio_enabled = QCheckBox("Enable audio when voice playback becomes available")
+        self.audio_enabled = QCheckBox("Enable ElevenLabs narration playback")
         self.volume = QSlider(Qt.Orientation.Horizontal)
         self.volume.setRange(0, 100)
         form.addRow("Audio", self.audio_enabled)

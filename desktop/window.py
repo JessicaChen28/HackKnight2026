@@ -2,6 +2,8 @@
 
 from pathlib import Path
 import os
+import shutil
+from uuid import uuid4
 from threading import Event
 from typing import Callable
 
@@ -13,7 +15,7 @@ from desktop.screens import CharacterCreationScreen, GameplayScreen, MainMenuScr
 from desktop.audio import AudioError, AudioPlayback, ElevenLabsAudioService
 from desktop.services import (AzgaarWorldProvider, CampaignIntro, GameError, GameService,
                               GameSession, MockGameService, PhaseTwoCampaignService,
-                              SampleWorldProvider, WorldProvider)
+                              SampleWorldProvider, WorldProvider, WorldRef)
 from desktop.storage import ApiKeyVault, GameSaveStore, Preferences
 
 
@@ -77,6 +79,7 @@ class MainWindow(QMainWindow):
         self._cancel: Event | None = None
         self._callback: Callable[[object], None] | None = None
         self._closing = False
+        self._pending_narration: tuple[str, str] | None = None
 
         root = QWidget()
         outer = QVBoxLayout(root)
@@ -198,6 +201,10 @@ class MainWindow(QMainWindow):
         self._cancel = None
         self._callback = None
         self._set_busy(False)
+        if self._pending_narration is not None and not self._closing:
+            text, world_name = self._pending_narration
+            self._pending_narration = None
+            self._start_narration(text, world_name)
         if self._closing:
             QTimer.singleShot(0, self.close)
 
@@ -217,6 +224,7 @@ class MainWindow(QMainWindow):
 
     def show_menu(self) -> None:
         if self._thread is None:
+            self.audio_playback.stop()
             self.stack.setCurrentWidget(self.menu)
             self._show_message("Ready.")
 
@@ -230,12 +238,33 @@ class MainWindow(QMainWindow):
             return
 
         def task(cancel: Event, progress: Callable[[str], None]) -> CampaignIntro:
-            world = provider.generate(export_root, cancel, progress)
-            progress("Preparing the offline campaign..." if active_service is self.demo_game_service
-                     else "Initializing your campaign with Gemini...")
-            if isinstance(active_service, PhaseTwoCampaignService):
-                return active_service.initialize_campaign(world, cancel, progress)
-            return active_service.initialize_campaign(world, cancel)
+            # Gemini-backed games are built below a private, owned directory.
+            # The resulting world directory is promoted only after all campaign
+            # files validate and persist successfully.
+            workspace = None
+            succeeded = False
+            try:
+                generation_root = export_root
+                if isinstance(active_service, PhaseTwoCampaignService):
+                    export_root.mkdir(parents=True, exist_ok=True)
+                    workspace = export_root / f".solar-pending-{uuid4().hex}"
+                    workspace.mkdir()
+                    generation_root = workspace
+                    progress("Generating world in a temporary campaign workspace...")
+                world = provider.generate(generation_root, cancel, progress)
+                progress("Preparing the offline campaign..." if active_service is self.demo_game_service
+                         else "Initializing your campaign with Gemini...")
+                intro = (active_service.initialize_campaign(world, cancel, progress)
+                         if isinstance(active_service, PhaseTwoCampaignService)
+                         else active_service.initialize_campaign(world, cancel))
+                if workspace is not None:
+                    world = self._promote_workspace_world(world, workspace, export_root)
+                    intro = CampaignIntro(world, intro.text)
+                succeeded = True
+                return intro
+            finally:
+                if workspace is not None and not succeeded:
+                    self._cleanup_workspace(workspace, export_root)
 
         if self._run_task("Preparing a world...", task, self._show_intro):
             self._active_game_service = active_service
@@ -246,16 +275,58 @@ class MainWindow(QMainWindow):
         self.creation.show_intro(value, is_offline_demo=self._active_game_service is self.demo_game_service)
         self.stack.setCurrentWidget(self.creation)
         self._show_message(f"Campaign ready: {value.world.name}")
-        if self.preferences.audio_enabled() and self.audio_service.api_key():
-            def narrate() -> None:
-                def task(cancel: Event, progress: Callable[[str], None]):
-                    try:
-                        return self.audio_service.speak_narration(value.text)
-                    except AudioError:
-                        return None
-                self._run_task("Generating narration audio...", task,
-                               lambda path: path and self.audio_playback.play(path, self.preferences.audio_volume()))
-            QTimer.singleShot(100, narrate)
+        print("ElevenLabs narration: introduction received by desktop.", flush=True)
+        if self.preferences.audio_enabled():
+            self._pending_narration = (value.text, value.world.name)
+        else:
+            print("ElevenLabs narration: audio is disabled in Settings.", flush=True)
+
+    @staticmethod
+    def _cleanup_workspace(workspace: Path, export_root: Path) -> None:
+        """Delete only an app-owned incomplete workspace beneath export_root."""
+        try:
+            root = export_root.resolve()
+            candidate = workspace.resolve()
+            if candidate.parent != root or not candidate.name.startswith(".solar-pending-"):
+                raise ValueError("Refusing to clean an unsafe workspace path.")
+            if candidate.exists():
+                shutil.rmtree(candidate)
+                print("Removed incomplete temporary campaign workspace.", flush=True)
+        except Exception as error:
+            print(f"Could not remove incomplete campaign workspace ({type(error).__name__}).", flush=True)
+
+    @staticmethod
+    def _promote_workspace_world(world: WorldRef, workspace: Path, export_root: Path) -> WorldRef:
+        source = Path(world.directory or "").resolve()
+        root, pending = export_root.resolve(), workspace.resolve()
+        if source.parent != pending or not pending.name.startswith(".solar-pending-"):
+            # Test and third-party providers written for the older interface may
+            # return an already-owned directory. Do not delete or move it.
+            pending.rmdir()
+            print("Campaign provider returned an external world directory; skipping workspace promotion.", flush=True)
+            return world
+        target = root / source.name
+        if target.exists():
+            raise GameError("A campaign with this generated identifier already exists.")
+        os.replace(source, target)  # atomic directory promotion on the same filesystem
+        pending.rmdir()
+        print(f"Promoted completed campaign: {target.name}", flush=True)
+        return WorldRef(world.name, str(target), world.seed)
+
+    def _start_narration(self, text: str, world_name: str) -> None:
+        if not self.audio_service.api_key():
+            self._show_message(f"Campaign ready: {world_name} (ElevenLabs key missing; text-only mode).")
+            return
+        def task(cancel: Event, progress: Callable[[str], None]):
+            if cancel.is_set():
+                print("ElevenLabs narration: worker cancelled before request.", flush=True)
+                return None
+            try:
+                return self.audio_service.speak_narration(text)
+            except AudioError:
+                return None
+        self._run_task("Generating narration audio...", task,
+                       lambda path: path and self.audio_playback.play(path, self.preferences.audio_volume()))
 
     def create_character(self) -> None:
         if self.intro is None or self._thread is not None:

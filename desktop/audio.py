@@ -40,12 +40,14 @@ class ElevenLabsAudioService:
             return self._client
         key = self.api_key()
         if not key:
+            print("ElevenLabs narration: API key missing; text-only mode.", flush=True)
             raise AudioError("ElevenLabs key is not configured; continuing in text-only mode.")
         try:
             from elevenlabs.client import ElevenLabs
         except ImportError as error:
             raise AudioError("Install ElevenLabs support with: python -m pip install -r requirements.txt") from error
         self._client = ElevenLabs(api_key=key)
+        print("ElevenLabs narration: API key present; client ready.", flush=True)
         return self._client
 
     @staticmethod
@@ -72,13 +74,18 @@ class ElevenLabsAudioService:
             raise AudioError("Cannot generate audio for empty text.")
         path = self._path(kind, text, voice_id)
         if path.exists() and path.stat().st_size:
+            print(f"ElevenLabs narration: cache hit ({path.name}, mp3).", flush=True)
             return path
+        print(f"ElevenLabs narration: cache miss; TTS request started ({kind}).", flush=True)
         client = self._sdk_client()
         try:
             stream = client.text_to_speech.convert(text=text, voice_id=voice_id or self.voice_id,
                                                     model_id=self.model, output_format="mp3_44100_128")
-            return self._write_stream(path, stream)
+            result = self._write_stream(path, stream)
+            print(f"ElevenLabs narration: TTS response saved ({result.name}, mp3).", flush=True)
+            return result
         except Exception as error:
+            print(f"ElevenLabs narration: TTS failed ({type(error).__name__}).", flush=True)
             raise AudioError("ElevenLabs narration generation failed.") from error
 
     def play_sound_effect(self, description: str) -> Path:
@@ -107,18 +114,27 @@ class AudioPlayback:
             self._output = QAudioOutput()
             self._player = QMediaPlayer()
             self._player.setAudioOutput(self._output)
+            self._player.errorOccurred.connect(self._on_error)
+            print("Qt Multimedia: narration playback available.", flush=True)
         except Exception:
             self._output = None
+            print("Qt Multimedia unavailable. Install with: python -m pip install -r requirements.txt", flush=True)
+
+    def _on_error(self, error) -> None:
+        print(f"Qt Multimedia: playback failed ({error}).", flush=True)
 
     def play(self, path: Path, volume: int = 70, loop: bool = False) -> None:
         if self._player is None:
+            print("Qt Multimedia: unable to play audio because playback is unavailable.", flush=True)
             return
         from PySide6.QtCore import QUrl
         self._output.setVolume(max(0, min(100, volume)) / 100)
         self._player.setLoops(-1 if loop else 1)
         self._player.setSource(QUrl.fromLocalFile(str(path)))
         self._player.play()
+        print(f"Qt Multimedia: playback started ({path.name}, mp3).", flush=True)
 
     def stop(self) -> None:
         if self._player is not None:
             self._player.stop()
+            print("Qt Multimedia: playback stopped.", flush=True)
