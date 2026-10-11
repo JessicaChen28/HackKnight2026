@@ -6,13 +6,17 @@ snapshot from the SAME world: Minimal JSON alone does not contain coordinates.
 
 import argparse
 from collections import defaultdict
-import json
 import math
 from pathlib import Path
 
 from shapely.geometry import LineString, MultiPolygon, Point, Polygon, box, mapping, shape
 from shapely.ops import linemerge, polygonize, unary_union
 from shapely.strtree import STRtree
+from safe_storage import DEFAULT_MAX_BYTES, checked_path, read_json, write_json, validate_json_tree, safe_message
+
+MAX_ENTITIES = 100_000
+MAX_CELLS = 100_000
+MAX_VERTICES = 1_000_000
 
 
 FIELDS = {
@@ -31,19 +35,74 @@ FIELDS = {
 
 def records(values):
     """Numeric/null placeholders are not entities; real ID zero records are."""
-    return [v for v in (values or []) if isinstance(v, dict) and "i" in v and not v.get("removed")]
+    if values is None:
+        return []
+    if not isinstance(values, list) or len(values) > MAX_ENTITIES:
+        raise ValueError("Entity collection must be an array within the record limit")
+    result = []
+    for index, value in enumerate(values):
+        if value is None or (index == 0 and type(value) is int and value == 0):
+            continue
+        if not isinstance(value, dict) or "i" not in value:
+            raise ValueError("Entity record must contain its original ID")
+        if not value.get("removed"):
+            result.append(value)
+    return result
 
 
 def finite_number(value):
-    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+    try:
+        return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+    except OverflowError:
+        return False
 
 
 def check_point(value):
     return isinstance(value, (list, tuple)) and len(value) == 2 and all(finite_number(v) for v in value)
 
 
+def validate_metadata(info):
+    if not isinstance(info, dict):
+        raise ValueError("Required world metadata must be an object")
+    for key, limit in (("mapName", 512), ("version", 64)):
+        if not isinstance(info.get(key), str) or not info[key].strip() or len(info[key]) > limit:
+            raise ValueError(f"Missing or invalid world metadata: {key}")
+    seed = info.get("seed")
+    if isinstance(seed, bool) or not isinstance(seed, (str, int)) or not str(seed) or len(str(seed)) > 128:
+        raise ValueError("Missing or invalid map seed")
+    for key in ("width", "height"):
+        if not finite_number(info.get(key)) or not 0 < info[key] <= 32768:
+            raise ValueError(f"Invalid map {key}; expected a positive number at most 32768")
+
+
+def validate_minimal(data):
+    validate_json_tree(data)
+    if not isinstance(data, dict):
+        raise ValueError("Minimal export must be a JSON object")
+    info, pack = data.get("info"), data.get("pack")
+    validate_metadata(info)
+    if not isinstance(info.get("description"), str) or "azgaar" not in info["description"].lower():
+        raise ValueError("Export metadata does not identify Azgaar")
+    if not isinstance(pack, dict):
+        raise ValueError("Required pack must be an object")
+    if "grid" in data or "cells" in pack or "vertices" in pack:
+        raise ValueError("Expected Minimal JSON, not Full or cell data")
+    if not isinstance(data.get("settings", {}), dict):
+        raise ValueError("Settings must be an object when present")
+    for key in FIELDS:
+        if key in pack and not isinstance(pack[key], list):
+            raise ValueError(f"pack.{key} must be an array")
+        entries = records(pack.get(key))
+        if key in ("burgs", "states", "features") and not entries:
+            raise ValueError(f"Required pack.{key} has no usable records")
+        ids = [entry["i"] for entry in entries]
+        if any(type(i) is not int or i < 0 for i in ids) or len(ids) != len(set(ids)):
+            raise ValueError(f"Invalid or duplicate IDs in {key}")
+
+
 def parse_world(data: dict) -> dict:
     """Keep only present fields, preserving IDs and index-addressed diplomacy."""
+    validate_minimal(data)
     info, settings, pack = data.get("info", {}), data.get("settings", {}), data.get("pack", {})
     metadata = {key: info[key] for key in ("mapName", "version", "seed", "width", "height") if key in info}
     metadata.update({key: settings[key] for key in ("distanceUnit", "distanceScale") if key in settings})
@@ -70,19 +129,66 @@ def parse_world(data: dict) -> dict:
 
 
 def validate_references(world):
+    if not isinstance(world, dict) or not isinstance(world.get("pack"), dict):
+        raise ValueError("World and pack must be objects")
+    validate_metadata(world.get("metadata"))
     pack = world["pack"]
     if not pack["burgs"] or not pack["states"]:
         raise ValueError("No settlements or states were extracted")
     for name, values in pack.items():
+        if not isinstance(values, list) or any(not isinstance(r, dict) or "i" not in r for r in values):
+            raise ValueError(f"Invalid entity records in {name}")
         ids = [r["i"] for r in values]
-        if any(not isinstance(i, int) or isinstance(i, bool) for i in ids) or len(ids) != len(set(ids)):
+        if any(type(i) is not int or i < 0 for i in ids) or len(ids) != len(set(ids)):
             raise ValueError(f"Invalid or duplicate IDs in {name}")
+        for record in values:
+            for key in ("name", "fullName", "type", "group", "formName", "note"):
+                if key in record and not isinstance(record[key], str):
+                    raise ValueError(f"{name}.{key} must be text")
     states = {s["i"] for s in pack["states"]}
+    cultures = {c["i"] for c in pack.get("cultures", [])}
+    features = {f["i"]: f for f in pack.get("features", [])}
+    if not features:
+        raise ValueError("Required geographic features are missing")
+    for feature in features.values():
+        if (type(feature.get("land")) is not bool or feature.get("type") not in ("island", "lake", "ocean")
+                or feature["land"] != (feature["type"] == "island")):
+            raise ValueError("Feature must have a land flag and recognized geographic type")
+    width, height = world["metadata"]["width"], world["metadata"]["height"]
+    for key in ("distanceScale",):
+        if key in world["metadata"] and (not finite_number(world["metadata"][key]) or world["metadata"][key] <= 0):
+            raise ValueError("Distance scale must be positive and finite")
+    if "distanceUnit" in world["metadata"] and not isinstance(world["metadata"]["distanceUnit"], str):
+        raise ValueError("Distance unit must be text")
     for burg in pack["burgs"]:
-        if "state" in burg and burg["state"] not in states:
-            raise ValueError(f"Settlement {burg['i']} references missing state {burg['state']}")
+        if type(burg.get("state")) is not int or burg["state"] not in states:
+            raise ValueError(f"Settlement {burg['i']} references missing state")
         if not check_point([burg.get("x"), burg.get("y")]):
             raise ValueError(f"Settlement {burg['i']} has no valid coordinates")
+        if not (0 <= burg["x"] <= width and 0 <= burg["y"] <= height):
+            raise ValueError(f"Settlement {burg['i']} lies outside map bounds")
+        if type(burg.get("feature")) is not int or burg["feature"] not in features or not features[burg["feature"]]["land"]:
+            raise ValueError(f"Settlement {burg['i']} references missing/non-land feature")
+        if "population" in burg and (not finite_number(burg["population"]) or burg["population"] < 0):
+            raise ValueError(f"Settlement {burg['i']} has invalid population")
+    for collection in ("burgs", "states", "religions"):
+        for record in pack.get(collection, []):
+            if "culture" in record and (type(record["culture"]) is not int or record["culture"] not in cultures):
+                raise ValueError(f"{collection} {record['i']} references missing culture")
+    burgs = {b["i"] for b in pack["burgs"]}
+    for state in pack["states"]:
+        if "capital" in state and (type(state["capital"]) is not int or state["capital"] not in burgs | {0}):
+            raise ValueError(f"State {state['i']} references missing capital")
+    for route in pack.get("routes", []):
+        if "feature" in route and (type(route["feature"]) is not int or route["feature"] not in features):
+            raise ValueError("Route references missing geographic feature")
+        for point in route.get("points", []):
+            if not (0 <= point[0] <= width and 0 <= point[1] <= height):
+                raise ValueError("Route point lies outside map bounds")
+    for marker in pack.get("markers", []):
+        if "x" in marker or "y" in marker:
+            if not check_point([marker.get("x"), marker.get("y")]) or not (0 <= marker["x"] <= width and 0 <= marker["y"] <= height):
+                raise ValueError("Marker has invalid or out-of-bounds coordinates")
 
 
 def polygon_parts(geometry):
@@ -104,6 +210,9 @@ def require_polygon(geometry, label):
 
 def reconstruct_features(data, source):
     """Union actual ordered cell rings; clip only to the exported map rectangle."""
+    if not isinstance(source, dict) or not isinstance(source.get("features"), list):
+        raise ValueError("Geometry source must contain a features array")
+    validate_json_tree(source)
     info = data["info"]
     if str(source.get("seed")) != str(info.get("seed")):
         raise ValueError("Geometry source seed does not match Minimal JSON")
@@ -117,16 +226,29 @@ def reconstruct_features(data, source):
     features = {f["i"]: f for f in records(data["pack"].get("features"))}
     expected = set(features)
     bounds, originals = box(0, 0, width, height), {}
+    total_cells = total_vertices = 0
     for feature in source.get("features", []):
+        if not isinstance(feature, dict) or type(feature.get("feature_id")) is not int or not isinstance(feature.get("cells"), list):
+            raise ValueError("Invalid geometry source feature structure")
         fid = feature["feature_id"]
         if fid in originals or fid not in expected:
             raise ValueError(f"Duplicate or unknown geometry feature {fid}")
         if "cells" in features[fid] and len(feature.get("cells", [])) != features[fid]["cells"]:
             raise ValueError(f"Feature {fid} cell count does not match Minimal JSON")
         cells = []
+        total_cells += len(feature["cells"])
+        if total_cells > MAX_CELLS:
+            raise ValueError("Geometry exceeds the cell limit")
         for ring in feature.get("cells", []):
-            if len(ring) < 3 or not all(check_point(p) for p in ring):
+            if not isinstance(ring, list) or len(ring) < 3 or not all(check_point(p) for p in ring):
                 raise ValueError(f"Feature {fid} has invalid cell coordinates")
+            total_vertices += len(ring)
+            if total_vertices > MAX_VERTICES:
+                raise ValueError("Geometry exceeds the vertex limit")
+            # Voronoi boundary vertices legitimately extend beyond the map.
+            # Bound their magnitude before GEOS; clip them as before afterward.
+            if any(abs(p[0]) > width * 16 or abs(p[1]) > height * 16 for p in ring):
+                raise ValueError("Source vertex exceeds the supported Voronoi envelope")
             polygon = Polygon(ring)
             require_polygon(polygon, f"Feature {fid} source cell")
             cells.append(polygon)
@@ -340,6 +462,8 @@ def build_coastlines(data, source, world, tolerance=3.0):
 
 def validate_outputs(world, coastlines):
     """Validate reloaded products without requiring browser state or the source."""
+    validate_json_tree(world)
+    validate_json_tree(coastlines)
     validate_references(world)
     metadata = world["metadata"]
     if str(metadata.get("seed")) != str(coastlines.get("seed")):
@@ -365,6 +489,8 @@ def validate_outputs(world, coastlines):
             for ring in polygon:
                 if len(ring) < 4 or ring[0] != ring[-1] or not all(check_point(p) for p in ring):
                     raise ValueError(f"Feature {fid} has invalid or unclosed coordinates")
+                if any(not (-1e-7 <= x <= width + 1e-7 and -1e-7 <= y <= height + 1e-7) for x, y in ring):
+                    raise ValueError(f"Feature {fid} has coordinates outside map bounds")
         geometries[fid] = shape(geojson)
     expected = {f["i"] for f in world["pack"]["features"]}
     expected_land = {f["i"] for f in world["pack"]["features"] if f.get("land")}
@@ -383,41 +509,36 @@ def validate_outputs(world, coastlines):
         raise ValueError(f"Populated settlements are off land: {[b['i'] for b in failed]}")
 
 
-def read_json(path):
-    def reject_constant(value):
-        raise ValueError(f"Non-JSON numeric constant: {value}")
-    with Path(path).open(encoding="utf-8-sig") as stream:
-        return json.load(stream, parse_constant=reject_constant)
-
-
-def write_json(path, data):
-    with Path(path).open("w", encoding="utf-8") as stream:
-        json.dump(data, stream, ensure_ascii=True, allow_nan=False, separators=(",", ":"))
-
-
-def process_world(minimal_path, source, tolerance=3.0):
+def process_world(minimal_path, source, tolerance=3.0, max_input_bytes=DEFAULT_MAX_BYTES):
     """Write products beside a retained Minimal file, refusing existing products."""
-    minimal_path = Path(minimal_path)
+    minimal_path = checked_path(minimal_path)
     world_path, coast_path = minimal_path.parent / "world.json", minimal_path.parent / "coastlines.json"
     if world_path.exists() or coast_path.exists():
         raise FileExistsError("Processed outputs already exist; use a new directory to reprocess")
-    data = read_json(minimal_path)
+    data = read_json(minimal_path, max_input_bytes)
     world = parse_world(data)
     coastlines = build_coastlines(data, source, world, tolerance)
     written = []
+    pending = minimal_path.parent / ".incomplete.json"
+    complete = minimal_path.parent / "complete.json"
+    if complete.exists():
+        raise FileExistsError("Completed world already exists")
+    write_json(pending, {"status": "processing"})
     try:
         for path, value in ((world_path, world), (coast_path, coastlines)):
-            # Exclusive creation avoids overwriting concurrent parser output.
-            with path.open("x", encoding="utf-8") as stream:
-                written.append(path)
-                json.dump(value, stream, ensure_ascii=True, allow_nan=False, separators=(",", ":"))
-        validate_outputs(read_json(world_path), read_json(coast_path))
+            write_json(path, value)
+            written.append(path)
+        validate_outputs(read_json(world_path, max_input_bytes), read_json(coast_path, max_input_bytes))
+        write_json(complete, {"schema_version": 1, "status": "complete", "files": [minimal_path.name, world_path.name, coast_path.name]})
+        written.append(complete)
     except BaseException:
         for path in written:
             path.unlink(missing_ok=True)
         raise
+    finally:
+        pending.unlink(missing_ok=True)
     stats, pack = coastlines["simplification"], world["pack"]
-    print(f"World: {world['metadata'].get('mapName', '(unnamed)')}")
+    print(f"World: {safe_message(world['metadata'].get('mapName', '(unnamed)'))}")
     print(f"Settlements: {len(pack['burgs'])}\nStates (including neutral): {len(pack['states'])}\nProvinces: {len(pack['provinces'])}")
     print(f"Landmasses: {len(coastlines['landmasses'])}\nWater bodies: {len(coastlines['water_bodies'])}")
     if any(e["feature_id"] is None for e in coastlines["water_bodies"]):
@@ -433,11 +554,13 @@ def main():
     parser.add_argument("minimal", type=Path)
     parser.add_argument("--geometry-source", type=Path, required=True, help="Same-world snapshot saved with --keep-geometry-source")
     parser.add_argument("--coastline-tolerance", type=float, default=3.0)
+    parser.add_argument("--max-input-mb", type=int, default=64)
     args = parser.parse_args()
     try:
-        process_world(args.minimal, read_json(args.geometry_source), args.coastline_tolerance)
+        limit = args.max_input_mb * 1024 * 1024
+        process_world(args.minimal, read_json(args.geometry_source, limit), args.coastline_tolerance, limit)
     except (ValueError, OSError, KeyError, TypeError) as error:
-        parser.exit(1, f"Processing failed: {error}\n")
+        parser.exit(1, f"Processing failed: {safe_message(error)}\n")
 
 
 if __name__ == "__main__":
