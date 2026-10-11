@@ -7,3 +7,4 @@ venv/
 .pytest_cache/
 *.part
 .staging-*/
+node_modules
