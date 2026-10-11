@@ -398,7 +398,10 @@ class MainWindow(QMainWindow):
             return
         action, session = self.game.action.toPlainText(), self.session
         self._run_task("Considering your action...",
-                       lambda cancel, progress: self._active_game_service.perform_action(session, action, cancel),
+                       lambda cancel, progress: (
+                           self._active_game_service.perform_action(session, action, cancel, progress)
+                           if isinstance(self._active_game_service, PhaseTwoCampaignService)
+                           else self._active_game_service.perform_action(session, action, cancel)),
                        self._show_session)
 
     def save_game(self) -> None:

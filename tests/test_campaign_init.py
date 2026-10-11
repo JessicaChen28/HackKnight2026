@@ -233,6 +233,27 @@ class InitializerTests(unittest.TestCase):
         finally:
             original_client.close()
 
+    def test_exhausted_quota_is_not_retried(self):
+        from google.genai import errors
+
+        client = ci.GeminiClient(api_key="test-only-key", max_request_attempts=2)
+        original_client = client._client
+        calls = []
+
+        def reject_request(**kwargs):
+            calls.append(1)
+            raise errors.ClientError(429, {"error": {"message": "Quota exhausted for this project"}})
+
+        client._client = SimpleNamespace(models=SimpleNamespace(generate_content=reject_request))
+        try:
+            with patch("campaign_init.time.sleep") as sleep:
+                with self.assertRaises(ci.CampaignInitError):
+                    client.generate("system", [("user", "prompt")])
+            self.assertEqual(len(calls), 1)
+            sleep.assert_not_called()
+        finally:
+            original_client.close()
+
     def test_real_azgaar_world_completes_local_campaign_stages(self):
         fixture_path = Path(__file__).parent / "fixtures" / "frepoyland.json.gz"
         with gzip.open(fixture_path, "rt", encoding="utf-8") as stream:

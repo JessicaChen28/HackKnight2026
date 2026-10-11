@@ -276,10 +276,12 @@ class GeminiClient:
                 _diagnostic(self._progress, f"Gemini API request {attempt} completed in {time.perf_counter() - started:.3f}s.")
                 return response.text
             except self._errors.APIError as error:
-                transient = getattr(error, "code", None) in (429, 500, 502, 503, 504)
                 code = getattr(error, "code", None)
                 status = code if type(code) is int else "unknown"
                 reason = _safe_api_message(error, self._api_key)
+                quota_exhausted = code == 429 and any(
+                    marker in reason.lower() for marker in ("quota", "billing", "insufficient credits"))
+                transient = code in (429, 500, 502, 503, 504) and not quota_exhausted
                 _diagnostic(self._progress, f"Gemini API request {attempt} failed after {time.perf_counter() - started:.3f}s (HTTP {status}): {reason}")
                 if not transient or attempt == self._max_request_attempts:
                     raise CampaignInitError(f"Gemini API request failed (HTTP {status}): {reason}") from error

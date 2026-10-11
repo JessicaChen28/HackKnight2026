@@ -28,4 +28,38 @@ Phase 3C supplies them.
 
 Phase 3B commits validated turn data only after every handler succeeds. Phase
 3C should not write files or call Gemini/ElevenLabs inside a handler. These
-constraints keep one turn as one persistence transaction.
+constraints let Phase 3B validate every proposed effect before it invokes the
+existing rollback helper.
+
+## Turn engine API
+
+`gameplay_turn.process_turn(directory, player_action, *, client=None,
+dispatcher=None, expected_turn=None, max_proposals=2, cancel_event=None,
+progress=None) -> TurnResult` loads the three authoritative JSON files and
+requires `gamestate.phase == "playing"` with a nonempty `player` object. Pass
+`expected_turn` from the current UI session to reject a stale submission.
+The engine locks the campaign directory while the request and commit run, so
+a second submission is rejected. The caller may inject a fake Gemini client
+with `generate(system_prompt, turns) -> str` for offline tests.
+
+The structured Gemini response is an object with required `narration` text and
+optional `dialogue`, `player_changes`, `operations`, `dm_note`, `audio_cues` and
+`status`. Dialogue entries use existing `speaker_id` values. Player changes
+allow bounded `health_delta` only when the character has numeric health, plus
+inventory and condition additions/removals against existing lists. Audio cues
+contain up to three sound-effect descriptions and one ambience description;
+Phase 3B returns them without making audio requests. `status` is `continue`
+or `campaign_complete`. Phase 3C operations use the schema above.
+
+`TurnResult` contains the committed turn number, narration, dialogue, world
+events, audio cues, status, a player snapshot, location and active quest names.
+The engine uses Phase 2's `save_all` rollback helper for files changed by the
+turn. This is a staged multi-file write with rollback on caught failures, not
+an atomic filesystem transaction across multiple JSON files. A process crash
+between file replacements still needs recovery work in a future phase.
+
+Phase 3A has not landed in this checkout. Its accepted-character step should
+set `gamestate.phase` to `playing`, populate `gamestate.player`, and keep
+`campaign.current_turn` at zero. The desktop adapter uses this engine once
+those conditions are true; earlier mock character creation continues to use
+its mock gameplay path.

@@ -43,6 +43,7 @@ class GameSession:
     inventory: list[str] = field(default_factory=list)
     quests: list[str] = field(default_factory=list)
     history: list[dict[str, str]] = field(default_factory=list)
+    turn: int = 0
 
 
 class WorldProvider(Protocol):
@@ -199,6 +200,40 @@ class PhaseTwoCampaignService:
         """Placeholder until the Phase 2 character-creation service is ready."""
         return self._placeholder.create_character(intro, description, cancel)
 
-    def perform_action(self, session: GameSession, action: str, cancel: Event) -> GameSession:
-        """Placeholder until the Phase 2 gameplay service is ready."""
-        return self._placeholder.perform_action(session, action, cancel)
+    def perform_action(self, session: GameSession, action: str, cancel: Event,
+                       progress: Progress | None = None) -> GameSession:
+        """Use Phase 3B for accepted characters; keep the demo placeholder."""
+        directory = session.world.directory
+        if not directory or not (Path(directory) / "gamestate.json").exists():
+            return self._placeholder.perform_action(session, action, cancel)
+        from safe_storage import read_json
+        state = read_json(Path(directory) / "gamestate.json")
+        if state.get("phase") != "playing":
+            return self._placeholder.perform_action(session, action, cancel)
+        from campaign_init import GeminiClient
+        from gameplay_turn import TurnError, process_turn
+
+        key = self._api_key().strip()
+        if not key:
+            raise GameError("Save a Gemini API key in Settings to continue the campaign.")
+        client = GeminiClient(api_key=key, progress=progress, cancel_event=cancel)
+        try:
+            result = process_turn(directory, action, client=client, expected_turn=session.turn,
+                                  cancel_event=cancel, progress=progress)
+        except TurnError as error:
+            raise GameError(str(error)) from error
+        finally:
+            client.close()
+        updated = deepcopy(session)
+        updated.turn = result.turn
+        updated.history.append({"speaker": "You", "text": action.strip()})
+        updated.history.append({"speaker": "Narrator", "text": result.narration})
+        updated.history.extend({"speaker": entry["speaker_id"], "text": entry["text"]}
+                               for entry in result.dialogue)
+        inventory = result.player.get("inventory")
+        if isinstance(inventory, list) and all(isinstance(item, str) for item in inventory):
+            updated.inventory = inventory
+        if result.location:
+            updated.location = result.location
+        updated.quests = list(result.quests)
+        return updated

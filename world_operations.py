@@ -72,7 +72,7 @@ def parse_operation(value: object) -> WorldOperation:
         "quest_update": {"type", "quest_id", "event"},
         "world_event": {"type", "description"},
     }
-    if kind not in allowed or set(value) - allowed[kind]:
+    if not isinstance(kind, str) or kind not in allowed or set(value) - allowed[kind]:
         raise ValueError("Unknown world operation or unsupported fields")
     if kind == "travel_request":
         destination = value.get("destination_burg_id")
@@ -80,7 +80,7 @@ def parse_operation(value: object) -> WorldOperation:
         if destination is not None and (type(destination) is not int or destination < 0):
             raise ValueError("Travel destination must be an existing burg ID")
         directions = {"north", "northeast", "east", "southeast", "south", "southwest", "west", "northwest"}
-        if direction is not None and direction not in directions:
+        if direction is not None and (not isinstance(direction, str) or direction not in directions):
             raise ValueError("Travel direction is invalid")
         if distance is not None and (type(distance) not in (int, float) or not math.isfinite(distance) or not 0 < distance <= 1000):
             raise ValueError("Travel distance is invalid")
@@ -122,6 +122,6 @@ class WorldDispatcher:
         if handler is None:
             raise ValueError(f"No world handler registered for {kind}")
         result = handler(operation, world, gamestate, notes)
-        if not isinstance(result, OperationOutcome) or not result.summary.strip():
+        if not isinstance(result, OperationOutcome) or not isinstance(result.summary, str) or not result.summary.strip():
             raise ValueError("World handler returned an invalid outcome")
         return result

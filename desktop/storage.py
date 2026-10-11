@@ -155,6 +155,9 @@ class GameSaveStore:
             for entry in history
         ):
             raise ValueError("Game save has invalid narration history.")
+        turn = item.get("turn", 0)
+        if type(turn) is not int or turn < 0:
+            raise ValueError("Game save has an invalid turn counter.")
         return GameSession(WorldRef(world["name"], world.get("directory"), world.get("seed")),
                            *(item[key] for key in required_text),
-                           inventory=item["inventory"], quests=item["quests"], history=history)
+                           inventory=item["inventory"], quests=item["quests"], history=history, turn=turn)
