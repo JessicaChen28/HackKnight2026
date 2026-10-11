@@ -3,8 +3,9 @@
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QFont, QPalette
 from PySide6.QtWidgets import (QCheckBox, QFormLayout, QGroupBox, QHBoxLayout, QLabel,
-                               QLineEdit, QListWidget, QPlainTextEdit, QPushButton,
-                               QScrollArea, QSizePolicy, QSlider, QVBoxLayout, QWidget)
+                               QLayout, QLineEdit, QListView, QListWidget, QPlainTextEdit,
+                               QPushButton, QScrollArea, QSizePolicy, QSlider, QVBoxLayout,
+                               QWidget)
 
 from desktop.services import CampaignIntro, GameSession
 
@@ -35,6 +36,32 @@ class SecretLineEdit(QLineEdit):
         font = QFont(self.font())
         font.setItalic(not bool(text))
         self.setFont(font)
+
+
+class WrappingListWidget(QListWidget):
+    """Show complete, wrapped entries inside the sidebar's single scroll area."""
+
+    def __init__(self):
+        super().__init__()
+        self.setWordWrap(True)
+        self.setTextElideMode(Qt.TextElideMode.ElideNone)
+        self.setResizeMode(QListView.ResizeMode.Adjust)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.setMinimumHeight(84)
+
+    def refresh_height(self) -> None:
+        self.doItemsLayout()
+        last = self.item(self.count() - 1) if self.count() else None
+        content_height = self.visualItemRect(last).bottom() + 1 if last else 0
+        height = max(self.minimumHeight(), content_height + 2 * self.frameWidth())
+        if self.height() != height:
+            self.setFixedHeight(height)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self.refresh_height()
 
 
 class MainMenuScreen(QWidget):
@@ -156,6 +183,7 @@ class GameplayScreen(QWidget):
         sidebar_content = QWidget()
         sidebar = QVBoxLayout(sidebar_content)
         sidebar.setContentsMargins(0, 0, 0, 0)
+        sidebar.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
         character_box = QGroupBox("Character")
         character_layout = QVBoxLayout(character_box)
         self.character_name = QLabel()
@@ -175,40 +203,36 @@ class GameplayScreen(QWidget):
         sidebar.addWidget(location_box)
         inventory_box = QGroupBox("Inventory")
         inventory_layout = QVBoxLayout(inventory_box)
-        self.inventory = QListWidget()
-        self.inventory.setMinimumHeight(0)
-        self.inventory.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Ignored)
+        self.inventory = WrappingListWidget()
         inventory_layout.addWidget(self.inventory)
-        sidebar.addWidget(inventory_box, 1)
+        sidebar.addWidget(inventory_box)
         quests_box = QGroupBox("Quests")
         quests_layout = QVBoxLayout(quests_box)
-        self.quests = QListWidget()
-        self.quests.setMinimumHeight(0)
-        self.quests.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Ignored)
+        self.quests = WrappingListWidget()
         quests_layout.addWidget(self.quests)
-        sidebar.addWidget(quests_box, 1)
+        sidebar.addWidget(quests_box)
         npc_box = QGroupBox("People")
         npc_layout = QVBoxLayout(npc_box)
-        self.npcs = QListWidget()
-        self.npcs.setMinimumHeight(0)
-        self.npcs.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Ignored)
+        self.npcs = WrappingListWidget()
         self.npcs.setToolTip("Double-click a person to prepare a conversation.")
         npc_layout.addWidget(self.npcs)
-        sidebar.addWidget(npc_box, 1)
-        nearby_box = QGroupBox("Nearby settlements")
+        sidebar.addWidget(npc_box)
+        nearby_box = QGroupBox("Nearby")
+        nearby_box.setToolTip("Nearby settlements")
         nearby_layout = QVBoxLayout(nearby_box)
-        self.nearby = QListWidget()
-        self.nearby.setMinimumHeight(0)
-        self.nearby.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Ignored)
+        self.nearby = WrappingListWidget()
         self.nearby.setToolTip("Double-click a settlement to prepare a travel action.")
         nearby_layout.addWidget(self.nearby)
-        sidebar.addWidget(nearby_box, 1)
+        sidebar.addWidget(nearby_box)
+        sidebar.addStretch()
         sidebar_scroll = QScrollArea()
         sidebar_scroll.setObjectName("gameplaySidebarScroll")
         sidebar_scroll.setWidgetResizable(True)
+        sidebar_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         sidebar_scroll.setWidget(sidebar_content)
         sidebar_scroll.setMinimumHeight(0)
         sidebar_scroll.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Ignored)
+        self.sidebar_scroll = sidebar_scroll
         columns.addWidget(sidebar_scroll, 1)
         outer.addLayout(columns, 1)
         row = QHBoxLayout()
@@ -240,6 +264,8 @@ class GameplayScreen(QWidget):
         self.npcs.addItems(session.npcs)
         self.nearby.clear()
         self.nearby.addItems(session.nearby)
+        for listing in (self.inventory, self.quests, self.npcs, self.nearby):
+            listing.refresh_height()
         self.action.clear()
         self.action.setFocus()
 

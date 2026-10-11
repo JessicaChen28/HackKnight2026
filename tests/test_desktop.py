@@ -187,6 +187,40 @@ class DesktopTests(unittest.TestCase):
             window, window.game.send_button.rect().bottomRight()).y()
         self.assertLessEqual(bottom, window.height())
 
+    def test_gameplay_sidebar_scrolls_complete_wrapped_entries(self):
+        window = self.window
+        self.begin_game()
+        window.resize(850, 420)
+        long_text = ("Find the merchant crate with forged customs seals at warehouse four "
+                     "and identify everyone who handled the shipment before dawn.")
+        window.session.inventory = [long_text]
+        window.session.quests = [long_text]
+        window.session.npcs = [long_text]
+        window.session.nearby = [long_text]
+        window.game.show_session(window.session)
+        self.app.processEvents()
+
+        sidebar = window.game.sidebar_scroll
+        self.assertGreater(sidebar.verticalScrollBar().maximum(), 0)
+        self.assertEqual(sidebar.horizontalScrollBar().maximum(), 0)
+        for listing in (window.game.inventory, window.game.quests,
+                        window.game.npcs, window.game.nearby):
+            self.assertGreater(listing.visualItemRect(listing.item(0)).height(),
+                               listing.fontMetrics().lineSpacing())
+            self.assertEqual(listing.horizontalScrollBar().maximum(), 0)
+            self.assertGreaterEqual(listing.height(), listing.visualItemRect(listing.item(0)).bottom())
+        sidebar.verticalScrollBar().setValue(sidebar.verticalScrollBar().maximum())
+        self.app.processEvents()
+        sidebar.verticalScrollBar().setValue(sidebar.verticalScrollBar().maximum())
+        self.app.processEvents()
+        nearby_bottom = window.game.nearby.mapTo(
+            sidebar.viewport(), window.game.nearby.visualItemRect(
+                window.game.nearby.item(0)).bottomRight()).y()
+        self.assertLessEqual(nearby_bottom, sidebar.viewport().height())
+        bottom = window.game.send_button.mapTo(
+            window, window.game.send_button.rect().bottomRight()).y()
+        self.assertLessEqual(bottom, window.height())
+
     def test_duplicate_generation_and_cancel(self):
         window = self.window
         window.menu.new_button.click()

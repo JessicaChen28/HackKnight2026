@@ -2,7 +2,7 @@
 ; removed by this installer or its uninstaller.
 
 #define AppName "SOLAR RPG"
-#define AppVersion "0.1.0"
+#define AppVersion "0.1.1"
 #define AppPublisher "SOLAR RPG Team"
 #define AppExeName "SOLAR RPG.exe"
 
