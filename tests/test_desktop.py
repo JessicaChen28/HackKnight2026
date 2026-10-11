@@ -15,7 +15,8 @@ from unittest.mock import patch
 from PySide6.QtCore import QSettings, Qt
 from PySide6.QtWidgets import QApplication
 
-from desktop.services import AzgaarWorldProvider, GameSession, MockGameService, WorldRef
+from desktop.services import (AzgaarWorldProvider, GameError, GameSession, MockGameService,
+                              PhaseTwoCampaignService, WorldRef)
 from desktop.storage import ApiKeyVault, Preferences, SERVICE_NAME
 from desktop.window import MainWindow
 from safe_storage import read_json, write_json
@@ -274,6 +275,23 @@ class DesktopTests(unittest.TestCase):
         self.assertEqual(world.directory, str(world_dir))
         self.assertEqual(world.name, "Actual Vale")
         self.assertEqual(world.seed, "55")
+
+    def test_phase_two_adapter_initializes_directory_with_key_and_returns_intro(self):
+        world_dir = self.root / "phase-two-world"
+        world_dir.mkdir()
+        service = PhaseTwoCampaignService(lambda: "saved-gemini-key")
+        with patch("campaign_init.GeminiClient", return_value=object()) as client, \
+             patch("campaign_init.initialize_campaign_from_directory", return_value="A real campaign opening.") as initialize:
+            intro = service.initialize_campaign(WorldRef("Bright Vale", str(world_dir)), Event())
+        client.assert_called_once_with(api_key="saved-gemini-key")
+        initialize.assert_called_once_with(world_dir, client=client.return_value)
+        self.assertEqual(intro.world.name, "Bright Vale")
+        self.assertEqual(intro.text, "A real campaign opening.")
+
+    def test_phase_two_adapter_requires_a_saved_gemini_key(self):
+        service = PhaseTwoCampaignService(lambda: "")
+        with self.assertRaisesRegex(GameError, "Save a Gemini API key"):
+            service.initialize_campaign(WorldRef("Bright Vale", str(self.root)), Event())
 
     def test_reject_malformed_save_without_credential_fields(self):
         candidate = self.root / "invalid.json"

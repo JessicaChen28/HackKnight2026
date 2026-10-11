@@ -10,7 +10,8 @@ from PySide6.QtWidgets import (QFileDialog, QHBoxLayout, QLabel, QMainWindow,
 
 from desktop.screens import CharacterCreationScreen, GameplayScreen, MainMenuScreen, SettingsScreen
 from desktop.services import (AzgaarWorldProvider, CampaignIntro, GameError, GameService,
-                              GameSession, MockGameService, SampleWorldProvider, WorldProvider)
+                              GameSession, MockGameService, PhaseTwoCampaignService,
+                              SampleWorldProvider, WorldProvider)
 from desktop.storage import ApiKeyVault, GameSaveStore, Preferences
 
 
@@ -47,7 +48,8 @@ class MainWindow(QMainWindow):
                  vault: ApiKeyVault | None = None,
                  world_provider: WorldProvider | None = None,
                  sample_provider: WorldProvider | None = None,
-                 game_service: GameService | None = None):
+                 game_service: GameService | None = None,
+                 demo_game_service: GameService | None = None):
         super().__init__()
         self.setWindowTitle("SOLAR RPG")
         self.resize(1120, 760)
@@ -55,7 +57,13 @@ class MainWindow(QMainWindow):
         self.vault = vault or ApiKeyVault(self.preferences.settings)
         self.world_provider = world_provider or AzgaarWorldProvider()
         self.sample_provider = sample_provider or SampleWorldProvider()
-        self.game_service = game_service or MockGameService()
+        # Phase 2A owns only the campaign opening. Character creation and play
+        # intentionally remain mock placeholders until their Phase 2 services
+        # arrive. The vault supplies the key in memory, never via a save file.
+        self.game_service = game_service or PhaseTwoCampaignService(
+            lambda: self.vault.session.get("gemini", ""))
+        self.demo_game_service = demo_game_service or MockGameService()
+        self._active_game_service: GameService = self.game_service
         self.save_store = GameSaveStore(self.preferences)
         self.intro: CampaignIntro | None = None
         self.session: GameSession | None = None
@@ -103,8 +111,8 @@ class MainWindow(QMainWindow):
             self.settings_screen.save_gemini_button, self.settings_screen.clear_gemini_button,
             self.settings_screen.choose_exports, self.settings_screen.choose_saves,
         ]
-        self.menu.new_button.clicked.connect(lambda: self.start_campaign(self.world_provider))
-        self.menu.demo_button.clicked.connect(lambda: self.start_campaign(self.sample_provider))
+        self.menu.new_button.clicked.connect(lambda: self.start_campaign(self.world_provider, self.game_service))
+        self.menu.demo_button.clicked.connect(lambda: self.start_campaign(self.sample_provider, self.demo_game_service))
         self.menu.load_button.clicked.connect(self.choose_game)
         self.menu.settings_button.clicked.connect(self.open_settings)
         self.menu.exit_button.clicked.connect(self.close)
@@ -204,22 +212,25 @@ class MainWindow(QMainWindow):
             self.stack.setCurrentWidget(self.menu)
             self._show_message("Ready.")
 
-    def start_campaign(self, provider: WorldProvider) -> None:
+    def start_campaign(self, provider: WorldProvider, service: GameService | None = None) -> None:
         if self._thread is not None:
             return
         export_root = self.preferences.export_root()
+        active_service = service or self.game_service
 
         def task(cancel: Event, progress: Callable[[str], None]) -> CampaignIntro:
             world = provider.generate(export_root, cancel, progress)
-            progress("Preparing campaign introduction...")
-            return self.game_service.initialize_campaign(world, cancel)
+            progress("Preparing the offline campaign..." if active_service is self.demo_game_service
+                     else "Initializing your campaign with Gemini...")
+            return active_service.initialize_campaign(world, cancel)
 
-        self._run_task("Preparing a world...", task, self._show_intro)
+        if self._run_task("Preparing a world...", task, self._show_intro):
+            self._active_game_service = active_service
 
     def _show_intro(self, value: object) -> None:
         assert isinstance(value, CampaignIntro)
         self.intro = value
-        self.creation.show_intro(value)
+        self.creation.show_intro(value, is_offline_demo=self._active_game_service is self.demo_game_service)
         self.stack.setCurrentWidget(self.creation)
         self._show_message(f"Campaign ready: {value.world.name}")
 
@@ -229,7 +240,7 @@ class MainWindow(QMainWindow):
         description = self.creation.description.toPlainText()
         intro = self.intro
         self._run_task("Creating character...",
-                       lambda cancel, progress: self.game_service.create_character(intro, description, cancel),
+                       lambda cancel, progress: self._active_game_service.create_character(intro, description, cancel),
                        self._show_session)
 
     def _show_session(self, value: object) -> None:
@@ -244,7 +255,7 @@ class MainWindow(QMainWindow):
             return
         action, session = self.game.action.toPlainText(), self.session
         self._run_task("Considering your action...",
-                       lambda cancel, progress: self.game_service.perform_action(session, action, cancel),
+                       lambda cancel, progress: self._active_game_service.perform_action(session, action, cancel),
                        self._show_session)
 
     def save_game(self) -> None:

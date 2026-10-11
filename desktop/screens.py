@@ -62,7 +62,7 @@ class MainMenuScreen(QWidget):
             layout.addWidget(button)
             layout.addSpacing(7)
         layout.addStretch()
-        footnote = QLabel("Offline demo text is local placeholder content. Gemini is not called until the Phase 2 service is connected.")
+        footnote = QLabel("New Game generates a world and asks Gemini for its campaign opening. Character creation and gameplay are local placeholders for now.")
         footnote.setWordWrap(True)
         footnote.setObjectName("mutedText")
         layout.addWidget(footnote)
@@ -75,7 +75,7 @@ class CharacterCreationScreen(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(34, 28, 34, 28)
         heading, detail = title("Your story", "A campaign opening awaits. Give this traveler a voice.")
-        self.mode_note = QLabel("Offline mock service · no Gemini request is being made")
+        self.mode_note = QLabel("Gemini wrote this campaign opening · character creation is a local placeholder")
         self.mode_note.setObjectName("mutedText")
         layout.addWidget(heading)
         layout.addWidget(detail)
@@ -99,8 +99,12 @@ class CharacterCreationScreen(QWidget):
         row.addWidget(self.create_button)
         layout.addLayout(row)
 
-    def show_intro(self, intro: CampaignIntro) -> None:
+    def show_intro(self, intro: CampaignIntro, *, is_offline_demo: bool = False) -> None:
         self.introduction.setPlainText(intro.text)
+        if is_offline_demo:
+            self.mode_note.setText("Offline mock campaign · no Gemini request was made")
+        else:
+            self.mode_note.setText("Gemini wrote this campaign opening · character creation is a local placeholder")
         self.description.clear()
         self.description.setFocus()
 
@@ -192,7 +196,7 @@ class SettingsScreen(QWidget):
         self.setObjectName("settings")
         outer = QVBoxLayout(self)
         outer.setContentsMargins(34, 28, 34, 28)
-        heading, detail = title("Settings", "Keys are optional for the current mock adventure.")
+        heading, detail = title("Settings", "Save a Gemini key to create campaign openings for newly generated worlds.")
         outer.addWidget(heading)
         outer.addWidget(detail)
         scroll = QScrollArea()

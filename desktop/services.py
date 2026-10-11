@@ -129,3 +129,57 @@ class MockGameService:
             narration = "The evening answers with a cold wind. Your choice carries you a little farther into the mystery."
         updated.history.append({"speaker": "Narrator", "text": narration})
         return updated
+
+
+class PhaseTwoCampaignService:
+    """Use Phase 2A for the opening, while later gameplay remains a mock.
+
+    The API key is deliberately supplied by a callable owned by the desktop
+    credential service. It is never read from settings files, game saves, or
+    environment variables by this adapter.
+    """
+
+    def __init__(self, api_key: Callable[[], str], placeholder: GameService | None = None):
+        self._api_key = api_key
+        self._placeholder = placeholder or MockGameService()
+
+    def initialize_campaign(self, world: WorldRef, cancel: Event) -> CampaignIntro:
+        check_cancelled(cancel)
+        if not world.directory:
+            raise GameError("This world has no saved directory for campaign initialization.")
+        key = self._api_key().strip()
+        if not key:
+            raise GameError("Save a Gemini API key in Settings before starting a new game.")
+
+        # Imported here so an offline demo can still launch if the optional
+        # Gemini SDK has not yet been installed.
+        from campaign_init import CampaignInitError, GeminiClient, initialize_campaign_from_directory
+
+        try:
+            client = GeminiClient(api_key=key)
+            check_cancelled(cancel)
+            message = initialize_campaign_from_directory(Path(world.directory), client=client)
+            check_cancelled(cancel)
+        except CampaignInitError as error:
+            # Do not surface a provider response or transport detail; either
+            # may include information unsuitable for the status area.
+            detail = str(error)
+            if "GEMINI_API_KEY" in detail or "GOOGLE_API_KEY" in detail:
+                raise GameError("Save a Gemini API key in Settings before starting a new game.") from error
+            if detail.startswith("Install the SDK:"):
+                raise GameError("Gemini support is not installed. Run: python -m pip install -r requirements.txt") from error
+            raise GameError("Gemini could not initialize this campaign. Check your key and connection, then retry.") from error
+        except ImportError as error:
+            raise GameError("Gemini support is not installed. Run: python -m pip install -r requirements.txt") from error
+
+        if not isinstance(message, str) or not message.strip():
+            raise GameError("Gemini returned an empty campaign introduction. Please retry.")
+        return CampaignIntro(world, message.strip())
+
+    def create_character(self, intro: CampaignIntro, description: str, cancel: Event) -> GameSession:
+        """Placeholder until the Phase 2 character-creation service is ready."""
+        return self._placeholder.create_character(intro, description, cancel)
+
+    def perform_action(self, session: GameSession, action: str, cancel: Event) -> GameSession:
+        """Placeholder until the Phase 2 gameplay service is ready."""
+        return self._placeholder.perform_action(session, action, cancel)
