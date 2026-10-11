@@ -34,13 +34,16 @@ class TaskWorker(QObject):
     progressed = Signal(str)
     done = Signal()
 
-    def __init__(self, task: Task, cancel: Event):
+    def __init__(self, task: Task, cancel: Event, task_id: int):
         super().__init__()
         self.task = task
         self.cancel = cancel
+        self.task_id = task_id
 
     @Slot()
     def run(self) -> None:
+        if os.environ.get("SOLAR_RPG_DEVELOPMENT") == "1":
+            print(f"Desktop task {self.task_id}: worker started on thread {QThread.currentThread().objectName()}.", flush=True)
         try:
             self.succeeded.emit(self.task(self.cancel, self.progressed.emit))
         except (GameError, ValueError) as error:
@@ -50,9 +53,11 @@ class TaskWorker(QObject):
             # future service exception might contain a request/API credential.
             self.failed.emit(f"Operation failed ({type(error).__name__}). Please retry.")
             if os.environ.get("SOLAR_RPG_DEVELOPMENT") == "1":
-                print(f"Desktop task exception: {type(error).__name__}: {str(error)[:500]}", flush=True)
-                traceback.print_exc()
+                print(f"Desktop task exception: {type(error).__name__}", flush=True)
+                print("".join(traceback.format_tb(error.__traceback__)), flush=True)
         finally:
+            if os.environ.get("SOLAR_RPG_DEVELOPMENT") == "1":
+                print(f"Desktop task {self.task_id}: worker emitted done.", flush=True)
             self.done.emit()
 
 
@@ -88,6 +93,11 @@ class MainWindow(QMainWindow):
         self._worker: TaskWorker | None = None
         self._cancel: Event | None = None
         self._callback: Callable[[object], None] | None = None
+        self._next_task_id = 0
+        self._active_task_id: int | None = None
+        # Keep Python wrappers alive through Qt's deferred deletion after
+        # QThread.finished. Releasing the worker in _task_finished was unsafe.
+        self._retired_tasks: dict[int, tuple[QThread, TaskWorker]] = {}
         self._closing = False
         self._pending_narration: tuple[str, str] | None = None
         self._pending_audio_cues: dict | None = None
@@ -154,6 +164,10 @@ class MainWindow(QMainWindow):
         self.cancel_button.clicked.connect(self.cancel_operation)
         if self.vault.warnings:
             self._show_error(" ".join(self.vault.warnings))
+        elif not self.preferences.settings.value("app/first_run_complete", False, type=bool):
+            self._show_message("Welcome to SOLAR RPG. Open Settings to add your Gemini and optional ElevenLabs keys.")
+            self.preferences.settings.setValue("app/first_run_complete", True)
+            self.preferences.settings.sync()
 
     def _set_busy(self, busy: bool, label: str = "") -> None:
         for control in self._controls:
@@ -183,32 +197,59 @@ class MainWindow(QMainWindow):
             return False
         self._cancel = Event()
         self._callback = callback
+        self._next_task_id += 1
+        task_id = self._next_task_id
+        self._active_task_id = task_id
         thread = QThread(self)
-        worker = TaskWorker(task, self._cancel)
+        thread.setObjectName(f"solar-task-{task_id}")
+        worker = TaskWorker(task, self._cancel, task_id)
         worker.moveToThread(thread)
         self._thread, self._worker = thread, worker
+        self._retired_tasks[task_id] = (thread, worker)
         thread.started.connect(worker.run)
         worker.progressed.connect(self._show_message)
         worker.succeeded.connect(self._task_succeeded)
         worker.failed.connect(self._show_error)
         worker.done.connect(thread.quit)
-        thread.finished.connect(self._task_finished)
         thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(self._task_finished)
         thread.finished.connect(thread.deleteLater)
+        thread.destroyed.connect(lambda *_args, identity=task_id: self._release_task(identity))
+        self._task_diagnostic(f"task {task_id} started; GUI thread={QThread.currentThread() == self.thread()}")
         self._set_busy(True, label)
         thread.start()
         return True
+
+    @staticmethod
+    def _task_diagnostic(message: str) -> None:
+        if os.environ.get("SOLAR_RPG_DEVELOPMENT") == "1":
+            print(f"Desktop lifecycle: {message}", flush=True)
+
+    def _release_task(self, task_id: int) -> None:
+        self._retired_tasks.pop(task_id, None)
+        self._task_diagnostic(f"task {task_id} Qt objects released")
 
     @Slot(object)
     def _task_succeeded(self, value: object) -> None:
         if self._callback is not None and not self._closing:
             try:
                 self._callback(value)
-            except Exception:
+            except Exception as error:
                 self._show_error("Could not display the result. Please retry.")
+                if os.environ.get("SOLAR_RPG_DEVELOPMENT") == "1":
+                    print(f"Desktop result callback failed: {type(error).__name__}", flush=True)
+                    print("".join(traceback.format_tb(error.__traceback__)), flush=True)
 
     @Slot()
     def _task_finished(self) -> None:
+        task_id = self._active_task_id
+        thread = self._thread
+        if os.environ.get("SOLAR_RPG_DEVELOPMENT") == "1":
+            from shiboken6 import isValid
+            running = thread.isRunning() if thread is not None and isValid(thread) else "unavailable"
+            self._task_diagnostic(f"task {task_id} finished; running={running}; "
+                                  f"GUI thread={QThread.currentThread() == self.thread()}")
+        self._active_task_id = None
         self._thread = None
         self._worker = None
         self._cancel = None
@@ -219,7 +260,13 @@ class MainWindow(QMainWindow):
             cues = self._pending_audio_cues
             self._pending_narration = None
             self._pending_audio_cues = None
-            self._start_narration(text, world_name, cues)
+            try:
+                self._start_narration(text, world_name, cues)
+            except Exception as error:
+                self._show_error("Audio could not start; the committed turn remains available as text.")
+                if os.environ.get("SOLAR_RPG_DEVELOPMENT") == "1":
+                    print(f"Desktop audio callback failed: {type(error).__name__}", flush=True)
+                    print("".join(traceback.format_tb(error.__traceback__)), flush=True)
         if self._closing:
             QTimer.singleShot(0, self.close)
 
@@ -235,6 +282,7 @@ class MainWindow(QMainWindow):
             self.cancel_operation()
             event.ignore()
         else:
+            self.audio_playback.stop()
             event.accept()
 
     def show_menu(self) -> None:
