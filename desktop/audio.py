@@ -13,6 +13,7 @@ from typing import Callable
 
 
 DEFAULT_VOICE = "Rachel"
+DEFAULT_VOICE_ID = "21m00Tcm4TlvDq8ikWAM"
 DEFAULT_MODEL = "eleven_multilingual_v2"
 
 
@@ -55,11 +56,12 @@ def _safe_elevenlabs_error(error, api_key: str = "") -> str:
 
 class ElevenLabsAudioService:
     def __init__(self, api_key: Callable[[], str] | str | None = None,
-                 cache_dir: Path | None = None, voice_id: str = DEFAULT_VOICE,
+                 cache_dir: Path | None = None, voice_id: str = DEFAULT_VOICE_ID,
                  model: str = DEFAULT_MODEL, client=None):
         self._key = api_key
         self.cache_dir = Path(cache_dir or (Path.home() / ".solar-rpg" / "audio-cache"))
         self.voice_id, self.model, self._client = voice_id, model, client
+        self._resolved_voices: dict[str, str] = {}
 
     def api_key(self) -> str:
         value = self._key() if callable(self._key) else self._key
@@ -84,6 +86,33 @@ class ElevenLabsAudioService:
         print("ElevenLabs narration: API key present; client ready.", flush=True)
         return self._client
 
+    def _resolve_voice_id(self, requested: str | None, client) -> str:
+        configured = (requested or self.voice_id or os.environ.get("ELEVENLABS_VOICE_ID", "")).strip()
+        if not configured:
+            raise AudioError("No ElevenLabs voice ID is configured.")
+        # Names are accepted as a convenience, but are resolved before any
+        # request. A display name is never passed as voice_id.
+        if configured in self._resolved_voices:
+            return self._resolved_voices[configured]
+        looks_like_id = bool(re.fullmatch(r"[A-Za-z0-9_-]{15,}", configured))
+        voices_api = getattr(client, "voices", None)
+        if not looks_like_id:
+            if voices_api is None or not hasattr(voices_api, "get_all"):
+                raise AudioError(f"ElevenLabs voice name '{configured}' could not be resolved.")
+            try:
+                voices = voices_api.get_all().voices
+            except Exception as error:
+                raise AudioError("Could not retrieve accessible ElevenLabs voices.") from error
+            match = next((voice for voice in voices
+                          if str(getattr(voice, "name", "")).casefold() == configured.casefold()), None)
+            resolved = str(getattr(match, "voice_id", "")) if match else ""
+            if not resolved:
+                raise AudioError(f"ElevenLabs voice name '{configured}' was not found in this account.")
+            self._resolved_voices[configured] = resolved
+            print(f"ElevenLabs narration: resolved voice name to account voice ID ({resolved}).", flush=True)
+            return resolved
+        return configured
+
     @staticmethod
     def _write_stream(path: Path, stream) -> Path:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -106,14 +135,15 @@ class ElevenLabsAudioService:
     def _tts(self, text: str, voice_id: str | None, kind: str) -> Path:
         if not text.strip():
             raise AudioError("Cannot generate audio for empty text.")
-        path = self._path(kind, text, voice_id)
+        client = self._sdk_client()
+        resolved_voice_id = self._resolve_voice_id(voice_id, client)
+        path = self._path(kind, text, resolved_voice_id)
         if path.exists() and path.stat().st_size:
             print(f"ElevenLabs narration: cache hit ({path.name}, mp3).", flush=True)
             return path
         print(f"ElevenLabs narration: cache miss; TTS request started ({kind}).", flush=True)
-        client = self._sdk_client()
         try:
-            stream = client.text_to_speech.convert(text=text, voice_id=voice_id or self.voice_id,
+            stream = client.text_to_speech.convert(text=text, voice_id=resolved_voice_id,
                                                     model_id=self.model, output_format="mp3_44100_128")
             result = self._write_stream(path, stream)
             print(f"ElevenLabs narration: TTS response saved ({result.name}, mp3).", flush=True)
@@ -121,7 +151,7 @@ class ElevenLabsAudioService:
         except Exception as error:
             diagnostic = _safe_elevenlabs_error(error, self.api_key())
             print(f"ElevenLabs narration: TTS failed type={type(error).__name__}; "
-                  f"voice={voice_id or self.voice_id}; model={self.model}; {diagnostic}", flush=True)
+                  f"voice={resolved_voice_id}; model={self.model}; {diagnostic}", flush=True)
             raise AudioError("ElevenLabs narration generation failed.") from error
 
     def play_sound_effect(self, description: str) -> Path:

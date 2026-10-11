@@ -10,8 +10,10 @@ from desktop.audio import AudioError, ElevenLabsAudioService, _safe_elevenlabs_e
 class FakeTTS:
     def __init__(self):
         self.calls = 0
+        self.last_voice = None
     def convert(self, **kwargs):
         self.calls += 1
+        self.last_voice = kwargs.get("voice_id")
         return [b"ID3", b" audio"]
 
 
@@ -19,6 +21,9 @@ class FakeClient:
     def __init__(self):
         self.text_to_speech = FakeTTS()
         self.sound_generation = FakeTTS()
+        self.voices = type("Voices", (), {"get_all": lambda self: type("Result", (), {
+            "voices": [type("Voice", (), {"name": "Rachel", "voice_id": "validVoiceId123456"})()]
+        })()})()
 
 
 class AudioTests(unittest.TestCase):
@@ -47,6 +52,20 @@ class AudioTests(unittest.TestCase):
             self.assertEqual(first, second)
             self.assertEqual(client.text_to_speech.calls, 1)
             self.assertEqual(first.read_bytes(), b"ID3 audio")
+
+    def test_voice_name_resolves_and_id_is_sent(self):
+        with TemporaryDirectory() as root:
+            client = FakeClient()
+            service = ElevenLabsAudioService("test-key", Path(root), voice_id="Rachel", client=client)
+            service.speak_narration("hello")
+            self.assertEqual(client.text_to_speech.last_voice, "validVoiceId123456")
+
+    def test_unknown_voice_name_fails_before_tts(self):
+        with TemporaryDirectory() as root:
+            client = FakeClient()
+            service = ElevenLabsAudioService("test-key", Path(root), voice_id="Deleted Voice", client=client)
+            with self.assertRaisesRegex(AudioError, "was not found"):
+                service.speak_narration("hello")
 
     def test_missing_key_is_non_secret_error(self):
         with TemporaryDirectory() as root:

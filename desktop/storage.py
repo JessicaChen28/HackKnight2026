@@ -34,13 +34,18 @@ class Preferences:
     def audio_volume(self) -> int:
         return int(self.settings.value("audio/volume", 70))
 
-    def update(self, export_root: str, save_root: str, audio_enabled: bool, volume: int) -> None:
+    def audio_voice_id(self) -> str:
+        return str(self.settings.value("audio/voice_id", os.environ.get("ELEVENLABS_VOICE_ID", "21m00Tcm4TlvDq8ikWAM")))
+
+    def update(self, export_root: str, save_root: str, audio_enabled: bool, volume: int, voice_id: str = "") -> None:
         if not export_root.strip() or not save_root.strip():
             raise ValueError("World export and save folders cannot be empty.")
         self.settings.setValue("paths/exports", str(Path(export_root).expanduser().absolute()))
         self.settings.setValue("paths/saves", str(Path(save_root).expanduser().absolute()))
         self.settings.setValue("audio/enabled", audio_enabled)
         self.settings.setValue("audio/volume", volume)
+        if voice_id.strip():
+            self.settings.setValue("audio/voice_id", voice_id.strip())
         self.settings.sync()
 
 

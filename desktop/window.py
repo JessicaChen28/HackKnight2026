@@ -77,7 +77,8 @@ class MainWindow(QMainWindow):
             self.vault.gemini_key)
         self.demo_game_service = demo_game_service or MockGameService()
         self.audio_service = ElevenLabsAudioService(self.vault_key_elevenlabs,
-                                                     self.preferences.base / "audio-cache")
+                                                     self.preferences.base / "audio-cache",
+                                                     voice_id=self.preferences.audio_voice_id())
         self.audio_playback = AudioPlayback()
         self._active_game_service: GameService = self.game_service
         self.save_store = GameSaveStore(self.preferences)
@@ -428,6 +429,7 @@ class MainWindow(QMainWindow):
         screen.remember_elevenlabs.setChecked(self.vault.is_saved("elevenlabs"))
         screen.audio_enabled.setChecked(self.preferences.audio_enabled())
         screen.volume.setValue(self.preferences.audio_volume())
+        screen.elevenlabs_voice_id.setText(self.preferences.audio_voice_id())
         screen.export_root.setText(str(self.preferences.export_root()))
         screen.save_root.setText(str(self.preferences.save_root()))
         self.stack.setCurrentWidget(screen)
@@ -489,8 +491,10 @@ class MainWindow(QMainWindow):
                 if checked and not value.strip():
                     raise ValueError(f"Enter a {provider} key before choosing Save key.")
             self.preferences.update(screen.export_root.text(), screen.save_root.text(),
-                                    screen.audio_enabled.isChecked(), screen.volume.value())
+                                    screen.audio_enabled.isChecked(), screen.volume.value(),
+                                    screen.elevenlabs_voice_id.text())
             self.vault.set_key("elevenlabs", screen.elevenlabs_key.text(), screen.remember_elevenlabs.isChecked())
+            self.audio_service.voice_id = screen.elevenlabs_voice_id.text().strip() or self.audio_service.voice_id
         except ValueError as error:
             self._show_error(str(error))
             return
