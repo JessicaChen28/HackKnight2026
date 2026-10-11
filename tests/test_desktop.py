@@ -18,7 +18,7 @@ from PySide6.QtWidgets import QApplication
 from desktop.services import (AzgaarWorldProvider, CampaignIntro, GameError, GameSession, MockGameService,
                               PhaseTwoCampaignService, WorldRef)
 from desktop.storage import ApiKeyVault, Preferences, SERVICE_NAME
-from desktop.window import MainWindow
+from desktop.window import CampaignPromotionError, MainWindow
 from safe_storage import read_json, write_json
 
 
@@ -360,6 +360,26 @@ class DesktopTests(unittest.TestCase):
         unrelated.mkdir()
         MainWindow._cleanup_workspace(unrelated, self.root)
         self.assertTrue(unrelated.exists())
+
+    def test_promotion_failure_preserves_completed_workspace(self):
+        pending = self.root / ".solar-pending-locked"
+        generated = pending / "World_locked"
+        generated.mkdir(parents=True)
+        (generated / "world.json").write_text("{}", encoding="utf-8")
+        with patch("desktop.window.os.replace", side_effect=OSError(5, "Access is denied")), \
+             patch("desktop.window.time.sleep"):
+            with self.assertRaisesRegex(CampaignPromotionError, "Recoverable files remain at"):
+                MainWindow._promote_workspace_world(WorldRef("World", str(generated)), pending, self.root)
+        self.assertTrue(generated.exists())
+
+    def test_promotion_collision_preserves_completed_workspace(self):
+        pending = self.root / ".solar-pending-collision"
+        generated = pending / "World_same"
+        generated.mkdir(parents=True)
+        (self.root / "World_same").mkdir()
+        with self.assertRaises(CampaignPromotionError):
+            MainWindow._promote_workspace_world(WorldRef("World", str(generated)), pending, self.root)
+        self.assertTrue(generated.exists())
 
     def test_audio_narration_is_queued_only_when_enabled(self):
         self.window.preferences.update(str(self.root / "exports"), str(self.root / "saves"), True, 70)

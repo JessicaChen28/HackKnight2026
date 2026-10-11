@@ -3,6 +3,8 @@
 from pathlib import Path
 import os
 import shutil
+import time
+import traceback
 from uuid import uuid4
 from threading import Event
 from typing import Callable
@@ -20,6 +22,10 @@ from desktop.storage import ApiKeyVault, GameSaveStore, Preferences
 
 
 Task = Callable[[Event, Callable[[str], None]], object]
+
+
+class CampaignPromotionError(GameError):
+    """A completed campaign could not be published, but remains recoverable."""
 
 
 class TaskWorker(QObject):
@@ -43,6 +49,9 @@ class TaskWorker(QObject):
             # Do not display a traceback or raw third-party exception text: a
             # future service exception might contain a request/API credential.
             self.failed.emit(f"Operation failed ({type(error).__name__}). Please retry.")
+            if os.environ.get("SOLAR_RPG_DEVELOPMENT") == "1":
+                print(f"Desktop task exception: {type(error).__name__}: {str(error)[:500]}", flush=True)
+                traceback.print_exc()
         finally:
             self.done.emit()
 
@@ -243,6 +252,7 @@ class MainWindow(QMainWindow):
             # files validate and persist successfully.
             workspace = None
             succeeded = False
+            preserve_workspace = False
             try:
                 generation_root = export_root
                 if isinstance(active_service, PhaseTwoCampaignService):
@@ -258,12 +268,16 @@ class MainWindow(QMainWindow):
                          if isinstance(active_service, PhaseTwoCampaignService)
                          else active_service.initialize_campaign(world, cancel))
                 if workspace is not None:
-                    world = self._promote_workspace_world(world, workspace, export_root)
-                    intro = CampaignIntro(world, intro.text)
+                    try:
+                        world = self._promote_workspace_world(world, workspace, export_root)
+                        intro = CampaignIntro(world, intro.text)
+                    except CampaignPromotionError:
+                        preserve_workspace = True
+                        raise
                 succeeded = True
                 return intro
             finally:
-                if workspace is not None and not succeeded:
+                if workspace is not None and not succeeded and not preserve_workspace:
                     self._cleanup_workspace(workspace, export_root)
 
         if self._run_task("Preparing a world...", task, self._show_intro):
@@ -302,14 +316,46 @@ class MainWindow(QMainWindow):
         if source.parent != pending or not pending.name.startswith(".solar-pending-"):
             # Test and third-party providers written for the older interface may
             # return an already-owned directory. Do not delete or move it.
-            pending.rmdir()
+            try:
+                pending.rmdir()
+            except OSError:
+                pass
             print("Campaign provider returned an external world directory; skipping workspace promotion.", flush=True)
             return world
         target = root / source.name
         if target.exists():
-            raise GameError("A campaign with this generated identifier already exists.")
-        os.replace(source, target)  # atomic directory promotion on the same filesystem
-        pending.rmdir()
+            raise CampaignPromotionError(f"Campaign promotion collision. Completed campaign remains at: {pending}")
+        # Source and target are siblings under the same configured export root,
+        # so os.replace is an atomic move when Windows/OneDrive permit it.
+        # OneDrive can briefly hold a directory after campaign files are saved.
+        last_error = None
+        for attempt in range(1, 4):
+            try:
+                os.replace(source, target)
+                last_error = None
+                break
+            except OSError as error:
+                last_error = error
+                print(f"Campaign promotion attempt {attempt}/3 failed: {type(error).__name__}, "
+                      f"winerror={getattr(error, 'winerror', None)}, errno={getattr(error, 'errno', None)}, "
+                      f"source={source}, target={target}", flush=True)
+                if os.environ.get("SOLAR_RPG_DEVELOPMENT") == "1":
+                    traceback.print_exc()
+                time.sleep(0.25 * attempt)
+        if last_error is not None:
+            # Do not clean up: all validated files remain in this private
+            # workspace for recovery or manual move after a OneDrive lock ends.
+            raise CampaignPromotionError(
+                f"Campaign initialized but could not be promoted (Windows error "
+                f"{getattr(last_error, 'winerror', None) or getattr(last_error, 'errno', 'unknown')}). "
+                f"Recoverable files remain at: {pending}") from last_error
+        try:
+            pending.rmdir()
+        except OSError as error:
+            # Promotion has succeeded. An empty pending directory is harmless;
+            # do not turn a completed campaign into an error.
+            print(f"Campaign promotion succeeded; empty workspace cleanup deferred "
+                  f"(winerror={getattr(error, 'winerror', None)}, path={pending}).", flush=True)
         print(f"Promoted completed campaign: {target.name}", flush=True)
         return WorldRef(world.name, str(target), world.seed)
 
