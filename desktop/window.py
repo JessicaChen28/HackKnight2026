@@ -79,7 +79,9 @@ class MainWindow(QMainWindow):
         self.audio_service = ElevenLabsAudioService(self.vault_key_elevenlabs,
                                                      self.preferences.base / "audio-cache",
                                                      voice_id=self.preferences.audio_voice_id())
-        self.audio_playback = AudioPlayback()
+        # QMediaPlayer/QAudioOutput are parented to the GUI window and are
+        # only driven by callbacks delivered on the GUI thread.
+        self.audio_playback = AudioPlayback(self)
         self._active_game_service: GameService = self.game_service
         self.save_store = GameSaveStore(self.preferences)
         self.intro: CampaignIntro | None = None

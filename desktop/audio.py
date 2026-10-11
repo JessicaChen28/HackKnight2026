@@ -175,18 +175,23 @@ class ElevenLabsAudioService:
 
 class AudioPlayback:
     """Qt multimedia playback, kept optional for headless tests."""
-    def __init__(self):
+    def __init__(self, parent=None):
         self._player = None
+        self._output = None
+        self._source = None
         try:
+            from PySide6.QtCore import QThread
             from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
-            self._output = QAudioOutput()
-            self._player = QMediaPlayer()
+            owner = parent if parent is not None else None
+            self._output = QAudioOutput(owner)
+            self._player = QMediaPlayer(owner)
             self._player.setAudioOutput(self._output)
             self._player.errorOccurred.connect(self._on_error)
-            print("Qt Multimedia: narration playback available.", flush=True)
-        except Exception:
-            self._output = None
+            self._qt_thread = QThread.currentThread()
+            print("Qt Multimedia: narration playback available on the GUI thread.", flush=True)
+        except Exception as error:
             print("Qt Multimedia unavailable. Install with: python -m pip install -r requirements.txt", flush=True)
+            print(f"Qt Multimedia initialization failed ({type(error).__name__}).", flush=True)
 
     def _on_error(self, error) -> None:
         print(f"Qt Multimedia: playback failed ({error}).", flush=True)
@@ -195,10 +200,14 @@ class AudioPlayback:
         if self._player is None:
             print("Qt Multimedia: unable to play audio because playback is unavailable.", flush=True)
             return
-        from PySide6.QtCore import QUrl
+        from PySide6.QtCore import QThread, QUrl
+        if self._player.thread() is not QThread.currentThread():
+            print("Qt Multimedia: refusing playback from a non-GUI thread.", flush=True)
+            return
         self._output.setVolume(max(0, min(100, volume)) / 100)
         self._player.setLoops(-1 if loop else 1)
-        self._player.setSource(QUrl.fromLocalFile(str(path)))
+        self._source = QUrl.fromLocalFile(str(path))
+        self._player.setSource(self._source)
         self._player.play()
         print(f"Qt Multimedia: playback started ({path.name}, mp3).", flush=True)
 

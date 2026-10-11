@@ -3,9 +3,12 @@
 import importlib.util
 import multiprocessing
 import sys
+import faulthandler
 
 
 def main() -> int:
+    if __import__("os").environ.get("SOLAR_RPG_DEVELOPMENT") == "1":
+        faulthandler.enable(all_threads=True)
     missing = [name for name in ("PySide6", "keyring") if importlib.util.find_spec(name) is None]
     if missing:
         print(f"Missing desktop dependencies: {', '.join(missing)}\n"
