@@ -135,15 +135,18 @@ class PhaseTwoCampaignService:
     """Use Phase 2A for the opening, while later gameplay remains a mock.
 
     The API key is deliberately supplied by a callable owned by the desktop
-    credential service. It is never read from settings files, game saves, or
-    environment variables by this adapter.
+    credential service. It is never read from settings files or game saves by
+    this adapter; the vault can use GEMINI_API_KEY if nothing was saved.
     """
 
     def __init__(self, api_key: Callable[[], str], placeholder: GameService | None = None):
         self._api_key = api_key
         self._placeholder = placeholder or MockGameService()
 
-    def initialize_campaign(self, world: WorldRef, cancel: Event) -> CampaignIntro:
+    def has_key(self) -> bool:
+        return bool(self._api_key().strip())
+
+    def initialize_campaign(self, world: WorldRef, cancel: Event, progress: Progress | None = None) -> CampaignIntro:
         check_cancelled(cancel)
         if not world.directory:
             raise GameError("This world has no saved directory for campaign initialization.")
@@ -155,10 +158,13 @@ class PhaseTwoCampaignService:
         # Gemini SDK has not yet been installed.
         from campaign_init import CampaignInitError, GeminiClient, initialize_campaign_from_directory
 
+        client = None
         try:
-            client = GeminiClient(api_key=key)
+            client = GeminiClient(api_key=key, progress=progress, cancel_event=cancel)
             check_cancelled(cancel)
-            message = initialize_campaign_from_directory(Path(world.directory), client=client)
+            message = initialize_campaign_from_directory(
+                Path(world.directory), client=client, max_attempts=2,
+                progress=progress, cancel_event=cancel)
             check_cancelled(cancel)
         except CampaignInitError as error:
             # Do not surface a provider response or transport detail; either
@@ -166,11 +172,24 @@ class PhaseTwoCampaignService:
             detail = str(error)
             if "GEMINI_API_KEY" in detail or "GOOGLE_API_KEY" in detail:
                 raise GameError("Save a Gemini API key in Settings before starting a new game.") from error
+            if detail == "Campaign initialization cancelled.":
+                raise GameError("Operation cancelled.") from error
             if detail.startswith("Install the SDK:"):
                 raise GameError("Gemini support is not installed. Run: python -m pip install -r requirements.txt") from error
+            if detail.startswith("Gemini could not produce a valid campaign"):
+                raise GameError("Gemini's campaign response did not pass validation after two proposals. Please retry.") from error
+            if detail.startswith("Could not reach Gemini") or detail.startswith("Gemini API request failed"):
+                raise GameError("The Gemini request failed or timed out. Check your connection and key, then retry.") from error
             raise GameError("Gemini could not initialize this campaign. Check your key and connection, then retry.") from error
         except ImportError as error:
             raise GameError("Gemini support is not installed. Run: python -m pip install -r requirements.txt") from error
+        finally:
+            close = getattr(client, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass  # Closing must not replace the operation's result.
 
         if not isinstance(message, str) or not message.strip():
             raise GameError("Gemini returned an empty campaign introduction. Please retry.")

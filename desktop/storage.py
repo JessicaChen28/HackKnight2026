@@ -1,6 +1,7 @@
 """User paths, opt-in OS credential storage, and small JSON game saves."""
 
 from dataclasses import asdict
+import os
 from pathlib import Path
 from uuid import uuid4
 
@@ -67,6 +68,10 @@ class ApiKeyVault:
             self.session[provider] = ""
             self.warnings.append(f"Could not read saved {provider} key from the OS credential manager.")
         return self.session[provider]
+
+    def gemini_key(self) -> str:
+        """Prefer the credential saved in Settings; use the environment if absent."""
+        return self.session["gemini"].strip() or os.environ.get("GEMINI_API_KEY", "").strip()
 
     def save_key(self, provider: str, value: str) -> None:
         """Store a nonempty key in the OS credential manager."""

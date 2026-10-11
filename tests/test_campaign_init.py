@@ -1,12 +1,17 @@
 """Offline tests with a synthetic world and a fake Gemini client (no network)."""
 
 import copy
+import gzip
 import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from threading import Event
+from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 import campaign_init as ci
+import world_parser
 
 
 def make_world():
@@ -128,6 +133,73 @@ class InitializerTests(unittest.TestCase):
                 ci.save_all(d, {"world.json": ({"a": 1}, True), "gamestate.json": ({"bad": object()}, False)})
             self.assertEqual(before, {n: (d / n).read_bytes() for n in before})
             self.assertEqual([p.name for p in d.glob(".*")], [])
+
+    def test_stage_diagnostics_report_timings_without_campaign_contents(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory)
+            ci._dump(path / "world.json", make_world(), True)
+            messages = []
+            introduction = ci.initialize_campaign_from_directory(
+                path, client=FakeClient(good_response()), progress=messages.append,
+                cancel_event=Event())
+            self.assertIn("Aldor", introduction)
+            for stage in ("input files loaded", "prompt prepared", "API stage ended",
+                          "response parsed", "validation stage ended", "persistence stage ended"):
+                self.assertTrue(any(stage in message for message in messages), stage)
+            self.assertNotIn(introduction, " ".join(messages))
+            self.assertTrue((path / "gamestate.json").exists())
+            self.assertTrue((path / "notes.json").exists())
+
+    def test_cancelled_campaign_does_not_write_files(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory)
+            ci._dump(path / "world.json", make_world(), True)
+            cancelled = Event()
+            cancelled.set()
+            with self.assertRaisesRegex(ci.CampaignInitError, "cancelled"):
+                ci.initialize_campaign_from_directory(
+                    path, client=FakeClient(good_response()), cancel_event=cancelled)
+            self.assertFalse((path / "gamestate.json").exists())
+
+    def test_gemini_request_timeout_and_retries_are_bounded(self):
+        client = ci.GeminiClient(api_key="test-only-key", timeout_seconds=1,
+                                 max_request_attempts=2)
+        original_client = client._client
+        try:
+            options = original_client._api_client._http_options
+            self.assertEqual(options.timeout, 1000)
+            self.assertEqual(options.retry_options.attempts, 1)
+            calls = []
+
+            def fail_request(**kwargs):
+                calls.append(1)
+                raise TimeoutError("simulated timeout")
+
+            client._client = SimpleNamespace(models=SimpleNamespace(generate_content=fail_request))
+            with patch("campaign_init.time.sleep") as sleep:
+                with self.assertRaisesRegex(ci.CampaignInitError, "request limit"):
+                    client.generate("test system", [("user", "test prompt")])
+            self.assertEqual(len(calls), 2)
+            sleep.assert_called_once_with(2)
+        finally:
+            original_client.close()
+
+    def test_real_azgaar_world_completes_local_campaign_stages(self):
+        fixture_path = Path(__file__).parent / "fixtures" / "frepoyland.json.gz"
+        with gzip.open(fixture_path, "rt", encoding="utf-8") as stream:
+            world = world_parser.parse_world(json.load(stream)["minimal"])
+        proposal = good_response()
+        proposal["message"] = f"Welcome to {world['pack']['burgs'][0]['name']}. Who are you?"
+        with TemporaryDirectory() as directory:
+            path = Path(directory)
+            ci._dump(path / "world.json", world, True)
+            messages = []
+            introduction = ci.initialize_campaign_from_directory(
+                path, client=FakeClient(proposal), progress=messages.append)
+            self.assertEqual(introduction, proposal["message"])
+            self.assertTrue((path / "gamestate.json").exists())
+            self.assertTrue((path / "notes.json").exists())
+            self.assertTrue(any("persistence stage ended" in m for m in messages))
 
     def test_world_brief_contains_ids_and_relations(self):
         brief = ci.build_world_brief(make_world())

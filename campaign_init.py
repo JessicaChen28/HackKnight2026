@@ -193,10 +193,23 @@ def build_correction_prompt(errors) -> str:
 
 # --------------------------------------------------------------------------- Gemini
 
+def _diagnostic(progress, message):
+    """Report only stage names and durations, never prompts or response data."""
+    print(message, flush=True)
+    if progress is not None:
+        progress(message)
+
+
+def _check_cancelled(cancel_event):
+    if cancel_event is not None and cancel_event.is_set():
+        raise CampaignInitError("Campaign initialization cancelled.")
+
+
 class GeminiClient:
     """Thin wrapper over google-genai. Tests can substitute any object with .generate()."""
 
-    def __init__(self, api_key=None, model=None, temperature=0.9, timeout_seconds=120):
+    def __init__(self, api_key=None, model=None, temperature=0.9, timeout_seconds=45,
+                 max_request_attempts=2, progress=None, cancel_event=None):
         key = api_key or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
         if not key:
             raise CampaignInitError("Set GEMINI_API_KEY (or GOOGLE_API_KEY) to call Gemini.")
@@ -209,30 +222,54 @@ class GeminiClient:
         self.model = (model or os.environ.get("GEMINI_MODEL") or DEFAULT_MODEL).strip()
         print(f"Using Gemini model: {self.model}", flush=True)
         self.temperature = temperature
-        self._client = genai.Client(api_key=key, http_options=types.HttpOptions(timeout=timeout_seconds * 1000))
+        if timeout_seconds <= 0 or not 1 <= max_request_attempts <= 3:
+            raise ValueError("Gemini timeout and retry settings are invalid.")
+        self._max_request_attempts = max_request_attempts
+        self._progress = progress
+        self._cancel_event = cancel_event
+        # The SDK can retry on its own. Disable those retries so the limits
+        # below are observable and bounded at the application layer.
+        self._client = genai.Client(
+            api_key=key,
+            http_options=types.HttpOptions(timeout=int(timeout_seconds * 1000),
+                                           retry_options=types.HttpRetryOptions(attempts=1)))
 
     def generate(self, system_prompt: str, turns) -> str:
         types = self._types
         contents = [types.Content(role=role, parts=[types.Part.from_text(text=text)]) for role, text in turns]
         config = types.GenerateContentConfig(system_instruction=system_prompt, temperature=self.temperature,
                                              response_mime_type="application/json")
-        for attempt in range(4):
+        for attempt in range(1, self._max_request_attempts + 1):
+            _check_cancelled(self._cancel_event)
+            started = time.perf_counter()
+            _diagnostic(self._progress, f"Gemini API request {attempt}/{self._max_request_attempts} started.")
             try:
                 response = self._client.models.generate_content(model=self.model, contents=contents, config=config)
                 if not response.text:
                     raise CampaignInitError("Gemini returned no text (possibly blocked by safety filters).")
+                _diagnostic(self._progress, f"Gemini API request {attempt} completed in {time.perf_counter() - started:.3f}s.")
                 return response.text
             except self._errors.APIError as error:
                 transient = getattr(error, "code", None) in (429, 500, 502, 503, 504)
-                if not transient or attempt == 3:
-                    raise CampaignInitError(f"Gemini API error: {error}") from error
-                time.sleep(2 ** attempt * 2)
+                _diagnostic(self._progress, f"Gemini API request {attempt} failed after {time.perf_counter() - started:.3f}s (HTTP {getattr(error, 'code', 'unknown')}).")
+                if not transient or attempt == self._max_request_attempts:
+                    raise CampaignInitError("Gemini API request failed. Check the key, model, and connection.") from error
             except CampaignInitError:
+                _diagnostic(self._progress, f"Gemini API request {attempt} returned no usable text after {time.perf_counter() - started:.3f}s.")
                 raise
             except Exception as error:  # network, DNS, timeouts
-                if attempt == 3:
-                    raise CampaignInitError(f"Could not reach Gemini: {error}") from error
-                time.sleep(2 ** attempt * 2)
+                _diagnostic(self._progress, f"Gemini API request {attempt} failed after {time.perf_counter() - started:.3f}s ({type(error).__name__}).")
+                if attempt == self._max_request_attempts:
+                    raise CampaignInitError("Could not reach Gemini within the request limit.") from error
+            delay = 2 ** attempt
+            _diagnostic(self._progress, f"Retrying Gemini API request in {delay}s.")
+            if self._cancel_event is not None:
+                self._cancel_event.wait(delay)
+            else:
+                time.sleep(delay)
+
+    def close(self) -> None:
+        self._client.close()
 
 
 def parse_model_json(raw: str) -> dict:
@@ -670,7 +707,7 @@ def save_all(directory, files):
 # --------------------------------------------------------------------------- public API
 
 def initialize_campaign(world: dict, gamestate: dict, notes: dict, directory=None,
-                        client=None, max_attempts: int = 3) -> str:
+                        client=None, max_attempts: int = 3, progress=None, cancel_event=None) -> str:
     """Ask Gemini for a campaign, validate it, apply it, and return the player-facing intro.
 
     On success the passed dicts are updated in place (and the three files saved
@@ -681,37 +718,62 @@ def initialize_campaign(world: dict, gamestate: dict, notes: dict, directory=Non
     if not world.get("pack", {}).get("burgs"):
         raise CampaignInitError("world.json has no settlements.")
     client = client or GeminiClient()
+    _check_cancelled(cancel_event)
+    stage_started = time.perf_counter()
     turns = [("user", build_user_prompt(world, gamestate, notes))]
+    _diagnostic(progress, f"Campaign prompt prepared in {time.perf_counter() - stage_started:.3f}s.")
     errors, built = ["no attempt made"], None
     for attempt in range(1, max_attempts + 1):
-        print(f"Campaign generation attempt {attempt}/{max_attempts}...", flush=True)
-        raw = client.generate(SYSTEM_PROMPT, turns)
+        _check_cancelled(cancel_event)
+        _diagnostic(progress, f"Campaign proposal {attempt}/{max_attempts}: requesting Gemini response.")
+        stage_started = time.perf_counter()
         try:
-            errors, built = validate_and_build(parse_model_json(raw), world, gamestate, notes)
+            raw = client.generate(SYSTEM_PROMPT, turns)
+        finally:
+            _diagnostic(progress, f"Campaign proposal {attempt}: API stage ended in {time.perf_counter() - stage_started:.3f}s.")
+        _check_cancelled(cancel_event)
+        stage_started = time.perf_counter()
+        try:
+            parsed = parse_model_json(raw)
         except ValueError as error:
             errors, built = [str(error)], None
+            _diagnostic(progress, f"Campaign response parsing failed in {time.perf_counter() - stage_started:.3f}s.")
+        else:
+            _diagnostic(progress, f"Campaign response parsed in {time.perf_counter() - stage_started:.3f}s.")
+            stage_started = time.perf_counter()
+            try:
+                errors, built = validate_and_build(parsed, world, gamestate, notes)
+            finally:
+                _diagnostic(progress, f"Campaign validation stage ended in {time.perf_counter() - stage_started:.3f}s.")
         if not errors:
             break
-        print(f"Rejected ({len(errors)} problems): {errors[0]}", flush=True)
+        _diagnostic(progress, f"Campaign proposal rejected ({len(errors)} validation problems); requesting correction.")
         turns += [("model", raw), ("user", build_correction_prompt(errors))]
     if errors or built is None:
         raise CampaignInitError(f"Gemini could not produce a valid campaign after {max_attempts} attempts. "
                                 f"Last problems: {errors[:5]}")
+    _check_cancelled(cancel_event)
     new_world, new_gs, new_notes, message = built
     if directory is not None:
+        _diagnostic(progress, "Persisting validated campaign files...")
+        stage_started = time.perf_counter()
         directory = Path(directory)
         base = directory / "world.base.json"
         if not base.exists() and (directory / "world.json").exists():
             shutil.copy2(directory / "world.json", base)  # pristine Azgaar world for --reset
-        save_all(directory, {"world.json": (new_world, True), "gamestate.json": (new_gs, False),
-                             "notes.json": (new_notes, False)})
+        try:
+            save_all(directory, {"world.json": (new_world, True), "gamestate.json": (new_gs, False),
+                                 "notes.json": (new_notes, False)})
+        finally:
+            _diagnostic(progress, f"Campaign persistence stage ended in {time.perf_counter() - stage_started:.3f}s.")
     for target, source in ((world, new_world), (gamestate, new_gs), (notes, new_notes)):
         target.clear()
         target.update(source)
     return message
 
 
-def initialize_campaign_from_directory(directory, client=None, max_attempts=3, reset=False) -> str:
+def initialize_campaign_from_directory(directory, client=None, max_attempts=3, reset=False,
+                                       progress=None, cancel_event=None) -> str:
     """Load (or create) the three files in a world directory and initialize the campaign."""
     directory = Path(directory)
     world_path = directory / "world.json"
@@ -719,10 +781,14 @@ def initialize_campaign_from_directory(directory, client=None, max_attempts=3, r
         shutil.copy2(directory / "world.base.json", world_path)
     if not world_path.exists():
         raise CampaignInitError(f"{world_path} not found. Run generate_world.py first.")
+    _check_cancelled(cancel_event)
+    stage_started = time.perf_counter()
     world = read_json(world_path)
     gamestate = initial_gamestate() if reset or not (directory / "gamestate.json").exists() else read_json(directory / "gamestate.json")
     notes = initial_notes() if reset or not (directory / "notes.json").exists() else read_json(directory / "notes.json")
-    return initialize_campaign(world, gamestate, notes, directory=directory, client=client, max_attempts=max_attempts)
+    _diagnostic(progress, f"Campaign input files loaded in {time.perf_counter() - stage_started:.3f}s.")
+    return initialize_campaign(world, gamestate, notes, directory=directory, client=client,
+                               max_attempts=max_attempts, progress=progress, cancel_event=cancel_event)
 
 
 def main() -> int:

@@ -283,10 +283,62 @@ class DesktopTests(unittest.TestCase):
         with patch("campaign_init.GeminiClient", return_value=object()) as client, \
              patch("campaign_init.initialize_campaign_from_directory", return_value="A real campaign opening.") as initialize:
             intro = service.initialize_campaign(WorldRef("Bright Vale", str(world_dir)), Event())
-        client.assert_called_once_with(api_key="saved-gemini-key")
-        initialize.assert_called_once_with(world_dir, client=client.return_value)
+        client.assert_called_once()
+        self.assertEqual(client.call_args.kwargs["api_key"], "saved-gemini-key")
+        initialize.assert_called_once()
+        self.assertEqual(initialize.call_args.args, (world_dir,))
+        self.assertIs(initialize.call_args.kwargs["client"], client.return_value)
+        self.assertEqual(initialize.call_args.kwargs["max_attempts"], 2)
         self.assertEqual(intro.world.name, "Bright Vale")
         self.assertEqual(intro.text, "A real campaign opening.")
+
+    def test_settings_key_precedes_environment_fallback(self):
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "environment-key"}):
+            self.assertEqual(self.vault.gemini_key(), "environment-key")
+            self.window.open_settings()
+            self.window.settings_screen.gemini_key.setText("settings-key")
+            self.window.settings_screen.save_gemini_button.click()
+            self.assertEqual(self.vault.gemini_key(), "settings-key")
+            self.assertEqual(ApiKeyVault(self.prefs.settings, backend=self.keyring).gemini_key(),
+                             "settings-key")
+            self.window.settings_screen.clear_gemini_button.click()
+            self.assertEqual(self.vault.gemini_key(), "environment-key")
+
+    def test_new_game_uses_settings_key_and_shows_gemini_introduction(self):
+        world_dir = self.root / "generated-world"
+        world_dir.mkdir()
+
+        class DirectoryProvider:
+            def generate(self, export_root, cancel, progress):
+                progress("Generated test world.")
+                return WorldRef("Bright Vale", str(world_dir))
+
+        live_window = MainWindow(preferences=self.prefs, vault=self.vault,
+                                 world_provider=DirectoryProvider())
+        live_window.show()
+        try:
+            live_window.open_settings()
+            live_window.settings_screen.gemini_key.setText("settings-test-key")
+            live_window.settings_screen.save_gemini_button.click()
+            live_window.settings_screen.back_button.click()
+
+            def initialize(directory, **kwargs):
+                kwargs["progress"]("Campaign response parsed in 0.0s.")
+                return "An introduction from Gemini."
+
+            with patch("campaign_init.GeminiClient", return_value=object()) as client, \
+                 patch("campaign_init.initialize_campaign_from_directory", side_effect=initialize) as init:
+                live_window.menu.new_button.click()
+                self.wait_until(lambda: live_window.stack.currentWidget() is live_window.creation)
+                self.wait_until(lambda: live_window._thread is None)
+            self.assertEqual(live_window.creation.introduction.toPlainText(),
+                             "An introduction from Gemini.")
+            self.assertIn("Gemini wrote", live_window.creation.mode_note.text())
+            self.assertEqual(client.call_args.kwargs["api_key"], "settings-test-key")
+            self.assertEqual(init.call_args.args, (world_dir,))
+            self.assertNotIn("settings-test-key", live_window.message.text())
+        finally:
+            live_window.close()
 
     def test_phase_two_adapter_requires_a_saved_gemini_key(self):
         service = PhaseTwoCampaignService(lambda: "")

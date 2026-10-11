@@ -61,7 +61,7 @@ class MainWindow(QMainWindow):
         # intentionally remain mock placeholders until their Phase 2 services
         # arrive. The vault supplies the key in memory, never via a save file.
         self.game_service = game_service or PhaseTwoCampaignService(
-            lambda: self.vault.session.get("gemini", ""))
+            self.vault.gemini_key)
         self.demo_game_service = demo_game_service or MockGameService()
         self._active_game_service: GameService = self.game_service
         self.save_store = GameSaveStore(self.preferences)
@@ -217,11 +217,16 @@ class MainWindow(QMainWindow):
             return
         export_root = self.preferences.export_root()
         active_service = service or self.game_service
+        if isinstance(active_service, PhaseTwoCampaignService) and not active_service.has_key():
+            self._show_error("Save a Gemini API key in Settings or set GEMINI_API_KEY before starting a new game.")
+            return
 
         def task(cancel: Event, progress: Callable[[str], None]) -> CampaignIntro:
             world = provider.generate(export_root, cancel, progress)
             progress("Preparing the offline campaign..." if active_service is self.demo_game_service
                      else "Initializing your campaign with Gemini...")
+            if isinstance(active_service, PhaseTwoCampaignService):
+                return active_service.initialize_campaign(world, cancel, progress)
             return active_service.initialize_campaign(world, cancel)
 
         if self._run_task("Preparing a world...", task, self._show_intro):
