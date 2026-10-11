@@ -1,6 +1,7 @@
 """Main window, navigation, and one-at-a-time Qt background tasks."""
 
 from pathlib import Path
+import os
 from threading import Event
 from typing import Callable
 
@@ -9,6 +10,7 @@ from PySide6.QtWidgets import (QFileDialog, QHBoxLayout, QLabel, QMainWindow,
                                QProgressBar, QPushButton, QStackedWidget, QVBoxLayout, QWidget)
 
 from desktop.screens import CharacterCreationScreen, GameplayScreen, MainMenuScreen, SettingsScreen
+from desktop.audio import AudioError, AudioPlayback, ElevenLabsAudioService
 from desktop.services import (AzgaarWorldProvider, CampaignIntro, GameError, GameService,
                               GameSession, MockGameService, PhaseTwoCampaignService,
                               SampleWorldProvider, WorldProvider)
@@ -63,6 +65,9 @@ class MainWindow(QMainWindow):
         self.game_service = game_service or PhaseTwoCampaignService(
             self.vault.gemini_key)
         self.demo_game_service = demo_game_service or MockGameService()
+        self.audio_service = ElevenLabsAudioService(self.vault_key_elevenlabs,
+                                                     self.preferences.base / "audio-cache")
+        self.audio_playback = AudioPlayback()
         self._active_game_service: GameService = self.game_service
         self.save_store = GameSaveStore(self.preferences)
         self.intro: CampaignIntro | None = None
@@ -109,6 +114,7 @@ class MainWindow(QMainWindow):
             self.game.menu_button, self.game.save_button, self.game.send_button,
             self.settings_screen.back_button, self.settings_screen.save_button,
             self.settings_screen.save_gemini_button, self.settings_screen.clear_gemini_button,
+            self.settings_screen.save_elevenlabs_button, self.settings_screen.clear_elevenlabs_button,
             self.settings_screen.choose_exports, self.settings_screen.choose_saves,
         ]
         self.menu.new_button.clicked.connect(lambda: self.start_campaign(self.world_provider, self.game_service))
@@ -125,6 +131,8 @@ class MainWindow(QMainWindow):
         self.settings_screen.save_button.clicked.connect(self.save_settings)
         self.settings_screen.save_gemini_button.clicked.connect(self.save_gemini_key)
         self.settings_screen.clear_gemini_button.clicked.connect(self.clear_gemini_key)
+        self.settings_screen.save_elevenlabs_button.clicked.connect(self.save_elevenlabs_key)
+        self.settings_screen.clear_elevenlabs_button.clicked.connect(self.clear_elevenlabs_key)
         self.settings_screen.choose_exports.clicked.connect(lambda: self.choose_folder(self.settings_screen.export_root))
         self.settings_screen.choose_saves.clicked.connect(lambda: self.choose_folder(self.settings_screen.save_root))
         self.cancel_button.clicked.connect(self.cancel_operation)
@@ -238,6 +246,16 @@ class MainWindow(QMainWindow):
         self.creation.show_intro(value, is_offline_demo=self._active_game_service is self.demo_game_service)
         self.stack.setCurrentWidget(self.creation)
         self._show_message(f"Campaign ready: {value.world.name}")
+        if self.preferences.audio_enabled() and self.audio_service.api_key():
+            def narrate() -> None:
+                def task(cancel: Event, progress: Callable[[str], None]):
+                    try:
+                        return self.audio_service.speak_narration(value.text)
+                    except AudioError:
+                        return None
+                self._run_task("Generating narration audio...", task,
+                               lambda path: path and self.audio_playback.play(path, self.preferences.audio_volume()))
+            QTimer.singleShot(100, narrate)
 
     def create_character(self) -> None:
         if self.intro is None or self._thread is not None:
@@ -320,6 +338,28 @@ class MainWindow(QMainWindow):
         else:
             self.settings_screen.gemini_key.clear()
             self._show_message("Gemini API key cleared.")
+
+    def vault_key_elevenlabs(self) -> str:
+        return self.vault.session["elevenlabs"] or os.environ.get("ELEVENLABS_API_KEY", "")
+
+    def save_elevenlabs_key(self) -> None:
+        try:
+            self.vault.set_key("elevenlabs", self.settings_screen.elevenlabs_key.text(), True)
+        except Exception:
+            self._show_error("Could not save the ElevenLabs key in the OS credential manager.")
+        else:
+            self.settings_screen.remember_elevenlabs.setChecked(True)
+            self._show_message("ElevenLabs API key saved securely.")
+
+    def clear_elevenlabs_key(self) -> None:
+        try:
+            self.vault.clear_key("elevenlabs")
+        except Exception:
+            self._show_error("Could not clear the ElevenLabs key from the OS credential manager.")
+        else:
+            self.settings_screen.elevenlabs_key.clear()
+            self.settings_screen.remember_elevenlabs.setChecked(False)
+            self._show_message("ElevenLabs API key cleared.")
 
     def save_settings(self) -> None:
         if self._thread is not None:
