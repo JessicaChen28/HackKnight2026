@@ -7,6 +7,10 @@ EXTRACT_GEOMETRY = """() => {
     if (!cells?.v || !cells?.f || !vertices?.p) {
         throw new Error('Azgaar cell/vertex coordinates are unavailable');
     }
+    if (!cells.i || cells.i.length > 100000 || !Array.isArray(features) || features.length > 100000) {
+        throw new Error('Azgaar geometry exceeds supported collection limits');
+    }
+    let vertexCount = 0;
     const groups = new Map();
     for (const feature of features) {
         if (feature && Number.isInteger(feature.i)) {
@@ -14,6 +18,9 @@ EXTRACT_GEOMETRY = """() => {
         }
     }
     for (const cell of cells.i) {
+        if (!Array.isArray(cells.v[cell]) || (vertexCount += cells.v[cell].length) > 1000000) {
+            throw new Error('Azgaar geometry exceeds supported vertex limits');
+        }
         const group = groups.get(cells.f[cell]);
         if (!group) throw new Error(`Unknown feature for cell ${cell}`);
         const ring = cells.v[cell].map(vertex => {

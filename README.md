@@ -4,7 +4,7 @@ Team: Hasan, Ayesha, and Jessica.
 
 ## Azgaar world exporter and geographic parser
 
-A standalone Python program that generates a fresh random world using Azgaar's own procedural pipeline, retains its **original Minimal JSON export**, and builds a compact RPG world with simplified geographic boundaries. Requires Python 3.10+ and internet access for generation. Offline parsing/tests require no browser or network. Dependencies are Playwright and Shapely (which installs NumPy).
+A standalone Python program that generates a fresh random world using Azgaar's own procedural pipeline, retains its **original Minimal JSON export**, and builds a compact RPG world with simplified geographic boundaries. Requires Python 3.10+ and internet access for generation. Offline parsing/tests require no browser or network. Pinned dependencies are Playwright, Shapely (which installs NumPy), and psutil for terminating the generation worker and its browser processes on cancellation or timeout. Windows/Python 3.12 was tested; Linux/macOS paths are implemented but not yet verified on those systems.
 
 ## Install
 
@@ -49,7 +49,15 @@ The helpers create a project-local `.venv`, install the pinned dependencies, and
 Set-ExecutionPolicy -Scope Process Bypass
 ```
 
-If you already use Conda, activate that environment first and run the same two commands there. The `python` used for installation must be the same `python` used to run the program. Verify it with `python -c "import sys; print(sys.executable)"`.
+If you already use Conda, activate that environment first and run the same two commands there. If `python generate_world.py` reports missing `psutil` (or another package), install with **that same `python`**:
+
+```powershell
+python -m pip install -r requirements.txt
+python -m playwright install chromium
+python generate_world.py
+```
+
+You can also run the project environment directly with `.\.venv\Scripts\python.exe generate_world.py` if you used `setup.ps1`. That avoids changing your Conda environment. Verify which interpreter your terminal uses with `python -c "import sys; print(sys.executable)"`.
 
 On Linux, if browser system libraries are missing, use `python -m playwright install --with-deps chromium`.
 
@@ -64,7 +72,7 @@ On Windows, you can double-click `run_generate_world.bat` or run it from a termi
 Show the browser while debugging or allow more time on a slow connection:
 
 ```sh
-python generate_world.py --headed --timeout 300
+python generate_world.py --headed --timeout 300 --total-timeout 600
 ```
 
 Control the maximum Ramer–Douglas–Peucker (RDP) simplification tolerance in Azgaar map coordinates:
@@ -73,21 +81,53 @@ Control the maximum Ramer–Douglas–Peucker (RDP) simplification tolerance in 
 python generate_world.py --coastline-tolerance 3
 ```
 
-Each invocation creates an isolated browser session, so Azgaar generates a new random world. During the **same session**, the script downloads Minimal JSON and reads the geographic mesh. Files are saved under `exports/` beside the script, regardless of working directory. The world directory uses Azgaar's suggested name plus a UTC timestamp and collision counter; atomic directory creation prevents overwriting earlier runs.
+Each invocation creates an isolated browser session, so Azgaar generates a new random world. During the **same session**, the script downloads Minimal JSON and reads the geographic mesh. Files are saved under `exports/` beside the script, regardless of working directory. Set `--export-root "C:/path/to/worlds"` for another writable location. World directory names use the sanitized display name plus a random UUID; download-suggested filenames are never used as paths. Files are built in a private staging directory and the whole directory is atomically published without overwriting anything after validation succeeds.
 
 ```text
 exports/
-  Orleans Minimal ..._<unique timestamp>/
+  Orleans_<unique UUID>/
     azgaar_minimal.json
     world.json
     coastlines.json
+    complete.json
 ```
 
 Existing flat JSON exports are left in place. `generate_world(...)` still returns the `Path` to the original export, now named `azgaar_minimal.json` inside the new directory.
 
-The original download remains byte-for-byte unchanged. Validation failures leave both the original and the captured `geometry_source.json` for diagnosis and report the failure; incomplete processed files are removed. Successful runs keep the source snapshot only with `--keep-geometry-source`. Browser resources close on success, failure, or Ctrl+C. Failures return a nonzero exit code. `--timeout` applies separately to each browser operation, not the entire run.
+The original download remains byte-for-byte unchanged. `complete.json` is a small completion manifest; new world consumers should require it before treating a directory as complete. Older validated worlds without this manifest remain readable with `validate_outputs`. Successful runs keep the source snapshot only with `--keep-geometry-source`. Browser resources close on success, failure, or Ctrl+C. Failures return a nonzero exit code. `--timeout` defaults to 180 seconds per browser operation; `--navigation-timeout`, `--export-timeout`, and `--geometry-timeout` override stage deadlines. `--total-timeout` defaults to 300 seconds for the entire worker, including retries; cleanup can take several more seconds. A separate worker allows even blocked downloads, JavaScript evaluation, and native geometry work to be terminated.
 
-If Azgaar produces inconsistent geography (for example, a settlement already outside its land feature), generation automatically tries a fresh random world, up to **five attempts**. Use `--attempts 1` to disable replacements or `--attempts N` to choose the limit. Rejected directories include `validation_error.json` and diagnostic inputs; they are not usable processed worlds. The final `Validation: PASSED` and `Saved world files:` messages identify the successful world directory. Disk, dependency, and network errors are not retried as bad worlds. Retrying cannot guarantee success if the upstream schema changes; exhaustion reports a nonzero exit status with the last validation error.
+If Azgaar produces inconsistent geography (for example, a settlement already outside its land feature), generation automatically tries a fresh random world, up to **five attempts**. Use `--attempts 1` to disable replacements or `--attempts N` (maximum 20) to choose the limit. Rejected attempts are kept separately under `exports/.failed/`, with `validation_error.json` and any diagnostic inputs captured before failure; they are not completed worlds. Network failures, timeouts, and cancellation remove staging data. The final `Validation: PASSED` and `Saved world files:` messages identify the successful world directory. Disk, dependency, and network errors are not retried as bad worlds. Retrying cannot guarantee success if the upstream schema changes; exhaustion reports a nonzero exit status.
+
+Input JSON is limited to 64 MiB per file by default (`--max-input-mb N` on both CLIs). Empty, malformed, duplicate-key, nonfinite, excessively nested, or oversized inputs fail explicitly. Required fields are nonempty name/version/seed metadata, bounded positive map dimensions, and usable settlements/states/features. Optional collections and fields may be absent, but present references must resolve. Limits also apply to entity counts and source geometry complexity. The original display name remains in metadata. See [SECURITY_AUDIT.md](SECURITY_AUDIT.md) for limits and tested safeguards.
+
+The supervisor also stops generation when combined worker/browser resident memory exceeds 2 GiB (`--max-memory-mb 2048`, or `max_memory_mb` in Python). This is a polled budget, not an OS quota: brief spikes can exceed it, and summed RSS can count shared memory more than once. Downloads are similarly checked while growing. Use a local filesystem supporting hard links and atomic renames (NTFS on Windows); storage paths containing symlinks or junctions are rejected.
+
+## Python desktop integration
+
+Keep generation off the UI thread, and use an event for cancellation. No HTTP server, credentials, or environment configuration is required:
+
+```python
+from pathlib import Path
+from threading import Event
+from generate_world import generate_world
+from generation_runtime import GenerationCancelled, GenerationError
+
+def create_world(storage: Path, cancelled: Event):
+    try:
+        raw = generate_world(export_root=storage, cancel_event=cancelled,
+                             progress=print, total_timeout_seconds=300)
+        return raw.parent  # contains validated files and complete.json
+    except GenerationCancelled:
+        return None
+    except GenerationError as error:
+        raise  # let the UI display the concise stage/error message
+
+if __name__ == "__main__":
+    cancelled = Event()  # the UI can call cancelled.set() from another thread
+    create_world(Path("exports"), cancelled)
+```
+
+The host entry point must use the `__main__` guard for multiprocessing; packaged executables should also call `multiprocessing.freeze_support()`. A progress callback runs in the caller's thread, must return promptly, and should queue messages to the UI thread. Use `progress=None` for silence. Only one operation per host process is allowed, with a kernel lock also preventing multiple CLI instances targeting the same export root. Imports do not launch a browser or exit Python. No function changes the host working directory or its environment. Direct `parse_world`, `process_world`, and `validate_outputs` remain available for offline use; their synchronous calls have no supervisor deadline, so do not call them on the UI thread with untrusted inputs.
 
 ## Output schemas
 
@@ -126,7 +166,7 @@ Tolerance `3` means three map units, independent of the map's distance display u
 python generate_world.py --keep-geometry-source
 ```
 
-This retains an optional fourth file, `geometry_source.json`, containing the same-world raw cell rings, seed, and dimensions. It is larger than the processed coastline file and is useful for debugging or trying other tolerances without reopening Azgaar. Failed parsing runs retain this snapshot automatically, even without the flag.
+This retains the additional file `geometry_source.json`, containing the same-world raw cell rings, seed, and dimensions. It is larger than the processed coastline file and is useful for debugging or trying other tolerances without reopening Azgaar. Failed parsing runs retain this snapshot under `.failed/` automatically, even without the flag.
 
 To reprocess, copy `azgaar_minimal.json` and `geometry_source.json` into a **new directory** (existing processed files are never overwritten), then run:
 
@@ -163,7 +203,17 @@ intersections = segment.intersection(land.boundary)
 python -m unittest discover -s tests -v
 ```
 
-The tests use a compressed **actual Azgaar world** under `tests/fixtures/` and run offline. They cover field/ID preservation, state references, original bytes remaining unchanged, populated coastal islands, lakes, nested holes, point containment, coast crossings, route connectivity, missing/mismatched geometry, Unicode edge cases, and independent reloading. Synthetic nested geometry supplements the real-world tests.
+The tests use compressed **actual Azgaar worlds** under `tests/fixtures/` and run offline. They cover field/ID preservation, state references, original bytes remaining unchanged, populated coastal islands, lakes, nested holes, point containment, coast crossings, route connectivity, missing/mismatched geometry, Unicode edge cases, and independent reloading. Security tests cover unsafe names, junctions/symlinks, collisions, corrupt/oversized JSON, partial writes, browser failure cleanup, and real subprocess cancellation/timeouts. Synthetic nested geometry supplements the real-world tests.
+
+The real-browser test is opt-in (requires internet and installed Chromium):
+
+```powershell
+$env:AZGAAR_LIVE_TEST = "1"
+python -m unittest discover -s tests -p test_live_generation.py -v
+Remove-Item Env:AZGAAR_LIVE_TEST
+```
+
+On macOS/Linux: `AZGAAR_LIVE_TEST=1 python -m unittest discover -s tests -p test_live_generation.py -v`. The test uses temporary storage and removes its world afterward. Phase 1 has no `.env` file requirement.
 
 Live captures on October 10, 2026 passed validation. With tolerance 3:
 

@@ -141,7 +141,10 @@ class RealWorldTests(unittest.TestCase):
         self.assertEqual(len(coast["water_bodies"]), len(self.coastlines["water_bodies"]))
 
     def test_missing_optional_fields_and_real_zero_records(self):
-        data = {"info": {}, "pack": {"burgs": [0, {"i": 17, "x": 1, "y": 2, "state": 0}], "states": [0, {"i": 0, "name": "Neutral"}]}}
+        data = {"info": self.data["info"], "pack": {
+            "burgs": [0, {"i": 17, "x": 1, "y": 2, "state": 0, "feature": 1}],
+            "states": [0, {"i": 0, "name": "Neutral"}],
+            "features": [0, {"i": 1, "land": True, "type": "island"}]}}
         world = wp.parse_world(data)
         self.assertEqual(world["pack"]["burgs"][0]["i"], 17)
         self.assertEqual(world["pack"]["states"][0]["i"], 0)

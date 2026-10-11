@@ -1,3 +1,9 @@
 .venv/
 __pycache__/
 exports/
+.env
+.env.*
+venv/
+.pytest_cache/
+*.part
+.staging-*/
